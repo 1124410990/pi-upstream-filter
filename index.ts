@@ -175,12 +175,14 @@ export default async function (pi: ExtensionApiLike) {
   const totals = newTotals();
   const appendDebugLog = makeDebugLogger(fs);
   let autoContinues = 0;
+  let afterAutoContinue = false;
   let lastAssistant: AssistantMessageLike | undefined;
   let pendingAutoContinue = false;
   let expectingAutoInput = false;
 
   const resetAutoContinue = () => {
     autoContinues = 0;
+    afterAutoContinue = false;
     lastAssistant = undefined;
     pendingAutoContinue = false;
     expectingAutoInput = false;
@@ -201,8 +203,15 @@ export default async function (pi: ExtensionApiLike) {
     pendingAutoContinue = false;
   });
   pi.on("turn_end", (event) => {
-    if (event.message.role === "assistant") lastAssistant = event.message;
-    // 工具轮或其他扩展续跑不代表整个任务完成，不重置累计次数。
+    if (event.message.role === "assistant") {
+      lastAssistant = event.message;
+      // 自动继续得到成功响应说明限流已恢复：重置预算，后续新中断从头计数。
+      // 若继续后立刻再次限流（无任何成功响应），预算继续累计，仍受五次上限约束。
+      if (afterAutoContinue && event.message.stopReason !== "error" && event.message.stopReason !== "aborted") {
+        autoContinues = 0;
+        afterAutoContinue = false;
+      }
+    }
     pendingAutoContinue = false;
   });
   pi.on("agent_before_settle", (event, ctx) => {
@@ -231,6 +240,7 @@ export default async function (pi: ExtensionApiLike) {
       return;
     }
     autoContinues++;
+    afterAutoContinue = true;
     expectingAutoInput = true;
     lastAssistant = undefined;
     try {

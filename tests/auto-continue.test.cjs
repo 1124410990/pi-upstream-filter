@@ -95,15 +95,32 @@ test("重复结束通知不能重置正在继续的任务预算，否则会突�
   }
 });
 
-test("工具轮成功不会重置同一任务的五次上限", async () => {
+test("继续后的成功响应重置预算；继续后立刻再失败仍累计；手动继续是新链；完成后不发送", async () => {
   const h = await harness();
-  for (let round = 0; round < 5; round++) {
-    await h.failedRound();
-    await h.input("extension", "继续");
-    await h.turn({role: "assistant", stopReason: "toolUse"});
-  }
   await h.failedRound();
-  assert.equal(h.sent.length, 5);
+  assert.equal(h.sent.length, 1);
+  await h.input("extension", "继续");
+  await h.turn({role: "assistant", stopReason: "toolUse"});
+  // 成功响应已重置预算，新中断应从 1/5 重新开始。
+  await h.failedRound();
+  assert.equal(h.sent.length, 2);
+  assert.match(h.notices.at(-1).message, /1\/5/);
+  // 继续后没有任何成功响应就再次限流，预算继续累计。
+  await h.input("extension", "继续");
+  await h.failedRound();
+  assert.equal(h.sent.length, 3);
+  assert.match(h.notices.at(-1).message, /2\/5/);
+  // 用户手动发送继续也是新计数链。
+  await h.input("interactive", "继续");
+  await h.failedRound();
+  assert.equal(h.sent.length, 4);
+  assert.match(h.notices.at(-1).message, /1\/5/);
+  // 正常完成不能发送继续。
+  await h.input("extension", "继续");
+  await h.turn({role: "assistant", stopReason: "stop"});
+  await h.boundary("completed");
+  await h.settled();
+  assert.equal(h.sent.length, 4);
 });
 
 test("用户手动发送继续也是新计数链，最终完成后新任务也可自动恢复", async () => {
