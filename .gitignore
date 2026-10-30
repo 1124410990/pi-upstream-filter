@@ -1,0 +1,16 @@
+node_modules/
+.runtime/
+*.log
+*.tgz
+.env
+.env.*
+
+# 不提交用户的 Pi 配置、凭据或运行记录
+.pi/
+auth.json
+models.json
+settings.json
+pi-upstream-filter.json
+
+# 不提交本机回滚备份
+pi-filter-backup*/

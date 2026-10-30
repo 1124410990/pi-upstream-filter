@@ -1,0 +1,35 @@
+{
+  "name": "pi-upstream-filter",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/1124410990/pi-upstream-filter.git"
+  },
+  "description": "Pi 中转端点历史推理与记录 ID 过滤扩展",
+  "keywords": ["pi-package"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "jiti": "2.7.0"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "files": [
+    "index.ts",
+    "filter-core.cjs",
+    "filter-core.d.cts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test tests/filter.test.cjs tests/reload.test.cjs",
+    "check": "node --check filter-core.cjs"
+  }
+}
