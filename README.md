@@ -4,6 +4,10 @@
 
 > 这是兼容性规避方案，不是密文解密工具，也不保证解决全部 Azure OpenAI 400 错误。删除历史内部推理状态可能影响复杂任务的连续表现。
 
+## v0.2.0
+
+新增 Token 限流自动继续：Pi 原生重试耗尽后，每项任务最多自动发送 5 次“继续”；支持取消、人工消息优先及次数耗尽提示。原请求体过滤行为保持不变。
+
 ## 支持范围
 
 目前离线验证环境：Windows、Node.js 22.22.3、`@earendil-works/pi-coding-agent` 1.4.0（最低 Node.js 版本按宿主要求为 22.19.0）。其他 Pi 发行版、版本和操作系统尚未验证；当前路径处理按 Windows 实现。
@@ -30,8 +34,22 @@
 - 上游强制要求工具调用携带对应历史 reasoning。
 - `previous_response_id`、`conversation`、`item_reference`、加密 compaction 等服务器状态引用。本扩展不会把它们展开，也不会像原 Codex HTTP 代理那样主动拒绝转发。
 - WebSocket 缓存续传可能在请求钩子之后追加状态；该场景未验证。
-- 429 限流、配额不足、鉴权错误、服务商不可用。扩展不新增模型请求重试。
+- Token 速率限流：原生重试耗尽后最多自动发送 5 次“继续”，仍可能无法恢复；其他 429、配额不足、鉴权错误和服务商不可用不触发此功能。
 - 过滤器异常时保留原请求、增加错误计数，并不提供严格阻断保证。
+
+## Token 限流自动继续
+
+当最后一次模型响应报 `token rate limit`（也匹配 `token_rate_limit` / `token-rate-limit`）时，先等待 Pi 原生重试、压缩和已有排队工作结束，再自动提交真实用户消息“继续”。不模拟键盘，不覆盖输入框草稿，不修改 Pi 的重试配置或额外增加等待。
+
+- 每项任务累计最多自动发送 **5 次**；原始任务不计入这 5 次。每次“继续”仍由 Pi 执行自己的重试策略。
+- 默认三次原生重试下，持续失败最多为 **24 次模型请求**：原任务及 5 次“继续”，每轮首次请求加三次重试。达到上限后明确提示耗尽，不再发送第六次。
+- 中途工具轮成功不重置次数；任务最终完成、主动取消、用户手动提交新消息（含手动“继续”）、切换会话或 `/reload` 会结束旧计数链。
+- 正常完成、非 Token 速率错误、鉴权失败和已识别的余额/配额不足不触发。已排队的人工消息和其他续跑优先。
+- 每次发送会显示 `继续（1/5）` 等通知；关闭或重载扩展不会安排后台续跑。
+
+此功能与请求体过滤分开，**不受上述过滤域名白名单和 Responses/Anthropic 开关限制**。自动发送“继续”不能解除服务商限流，仍可能全部失败并增加请求和费用；需要停止时按 Escape 取消当前任务。只安装一个扩展副本，避免重复续跑。
+
+使用 Pi 1.4.0 的 `agent_before_settle` / `agent_settled` 事件及 `sendUserMessage` API；其他版本尚未验证。
 
 ## 安装
 
@@ -43,10 +61,10 @@ pi --no-extensions --extension ./index.ts
 
 `--no-extensions` 用于避免本机已安装副本与试用副本重复注册 `/filter`，仅对本次运行有效。
 
-GitHub 安装（需要仓库已有 `v0.1.0` 标签）：
+GitHub 安装（使用本次发布的 `v0.2.0` 标签）：
 
 ```text
-pi install git:github.com/1124410990/pi-upstream-filter@v0.1.0
+pi install git:github.com/1124410990/pi-upstream-filter@v0.2.0
 ```
 
 在当前 Pi 窗口执行：
@@ -57,6 +75,15 @@ pi install git:github.com/1124410990/pi-upstream-filter@v0.1.0
 ```
 
 首次无配置时默认开启 Responses 和 Anthropic 过滤；已有配置中的开关保持不变。若已有手工安装副本，请先通过 `pi config` 禁用它，再安装包，避免重复命令和重复过滤。
+
+Git 标签安装是固定版本，`/reload` 不会升级旧标签。从 `v0.1.0` 升级请在终端执行：
+
+```text
+pi remove git:github.com/1124410990/pi-upstream-filter@v0.1.0
+pi install git:github.com/1124410990/pi-upstream-filter@v0.2.0
+```
+
+然后回到 Pi 窗口执行 `/reload`。本地路径安装只需更新对应源码后 `/reload`。
 
 ## 配置与统计
 
@@ -77,14 +104,14 @@ pi install git:github.com/1124410990/pi-upstream-filter@v0.1.0
 卸载 GitHub 包时使用与安装相同的 source：
 
 ```text
-pi remove git:github.com/1124410990/pi-upstream-filter@v0.1.0
+pi remove git:github.com/1124410990/pi-upstream-filter@v0.2.0
 ```
 
 然后 `/reload`。个人开关和诊断日志不属于包源码，可自行保留。
 
 ## 开发与测试
 
-只测试过滤和加载，不调用收费模型。测试会清理自己创建的临时目录，不修改用户配置。
+只测试过滤、加载和自动续跑，不调用收费模型。测试会清理自己创建的临时目录，不修改用户配置。
 
 普通开发环境安装测试依赖（不安装宿主 peer、不执行依赖生命周期脚本）：
 
@@ -99,10 +126,11 @@ npm run check
 ```powershell
 $env:PI_TEST_PACKAGE_DIR = "<本机 pi-coding-agent 的安装目录>"
 npm test
+npm run test:host
 npm run check
 ```
 
-包含 4 项核心测试和 2 项热重载回归测试，覆盖白名单、工具配对、请求不变性和旧 CJS 导出缓存。实际供应商多轮会话、长会话压缩和完整 Pi UI 尚需自行验证。
+普通测试包含 4 项核心测试、2 项热重载回归测试和 7 项自动继续回归测试（含重复结束通知不重置五次预算）。`test:host` 另有 2 项真实 Pi 会话离线测试，替换模型输出且阻止联网，验证三次重试后发送、五次上限、恢复成功及取消。该命令必须设置 `PI_TEST_PACKAGE_DIR`，缺失直接报错，不静默跳过。实际供应商多轮会话、长会话压缩和完整 Pi UI 尚需自行验证。
 
 ## GitHub 发布前检查
 

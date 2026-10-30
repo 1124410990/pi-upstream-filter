@@ -11,7 +11,8 @@
  * - anthropic-messages（Claude 系）：删历史 assistant 消息的 thinking/redacted_thinking 块。
  * - 其他 API 的请求体原样放行。
  *
- * 仅对 agentrouter.org、ps.air-outer.com 的 HTTPS 端点启用；其他端点原样放行。
+ * 请求体过滤仅对 agentrouter.org、ps.air-outer.com 的 HTTPS 端点启用；其他端点原样放行。
+ * Token 速率限流在宿主重试耗尽后最多自动发送 5 次“继续”，不受过滤域名限制。
  * 无端口、无后台进程；修改后 /reload 即生效。/filter 查看统计，/filter responses|anthropic on|off 切换。
  * 配置持久化在 ~/.pi/agent/pi-upstream-filter.json。
  *
@@ -26,14 +27,41 @@ interface UiLike {
   notify(message: string, level?: "info" | "warning" | "error"): unknown;
 }
 
+interface AssistantMessageLike {
+  role: string;
+  stopReason?: string;
+  errorMessage?: string;
+}
+
+interface EventContextLike {
+  ui: UiLike;
+  model?: { baseUrl?: string };
+  isIdle(): boolean;
+  hasPendingMessages(): boolean;
+  signal?: AbortSignal;
+}
+
+interface ExtensionEventsLike {
+  before_provider_request: { type: "before_provider_request"; payload: unknown };
+  input: { source: string; text: string };
+  before_agent_start: { messageType: "user" | "custom" };
+  turn_end: { message: AssistantMessageLike };
+  agent_before_settle: {
+    outcome: "completed" | "aborted" | "error";
+    continue: boolean;
+    context: { pendingMessages: unknown[] };
+  };
+  agent_settled: { aborted: boolean };
+  session_start: unknown;
+  session_shutdown: unknown;
+}
+
 interface ExtensionApiLike {
-  on(
-    event: "before_provider_request",
-    handler: (
-      event: { type: "before_provider_request"; payload: unknown },
-      ctx: { model?: { baseUrl?: string } },
-    ) => unknown,
+  on<K extends keyof ExtensionEventsLike>(
+    event: K,
+    handler: (event: ExtensionEventsLike[K], ctx: EventContextLike) => unknown,
   ): () => void;
+  sendUserMessage(content: string, options: { deliverAs: "followUp" }): void;
   registerCommand(
     name: string,
     options: {
@@ -62,6 +90,10 @@ interface Totals {
 }
 
 const DEFAULT_CONFIG: FilterConfig = { responses: true, anthropic: true };
+const MAX_AUTO_CONTINUES = 5;
+const TOKEN_RATE_LIMIT = /\btoken(?:s)?[\s_-]+rate[\s_-]+limit\b/i;
+// 持久性账号限制不能靠“继续”恢复，即使错误正文同时提及 Token 限流。
+const TERMINAL_LIMIT_ERROR = /\b(?:401|403)\b|authentication|authorization|invalid api key|insufficient_quota|quota exceeded|billing|available balance|out of budget|usage_limit_exceeded|(?:monthly|daily|weekly) usage limit|GoUsageLimitError|FreeUsageLimitError/i;
 
 function agentDir(): string {
   const home = process.env.USERPROFILE || process.env.HOME || "";
@@ -142,6 +174,74 @@ export default async function (pi: ExtensionApiLike) {
   const config = await loadConfig();
   const totals = newTotals();
   const appendDebugLog = makeDebugLogger(fs);
+  let autoContinues = 0;
+  let lastAssistant: AssistantMessageLike | undefined;
+  let pendingAutoContinue = false;
+  let expectingAutoInput = false;
+
+  const resetAutoContinue = () => {
+    autoContinues = 0;
+    lastAssistant = undefined;
+    pendingAutoContinue = false;
+    expectingAutoInput = false;
+  };
+
+  pi.on("session_start", resetAutoContinue);
+  pi.on("session_shutdown", resetAutoContinue);
+  pi.on("input", (event) => {
+    const ownContinue = expectingAutoInput && event.source === "extension" && event.text === "继续";
+    if (!ownContinue) resetAutoContinue();
+    expectingAutoInput = false;
+    lastAssistant = undefined;
+    pendingAutoContinue = false;
+  });
+  pi.on("before_agent_start", (event) => {
+    if (event.messageType !== "user") resetAutoContinue();
+    lastAssistant = undefined;
+    pendingAutoContinue = false;
+  });
+  pi.on("turn_end", (event) => {
+    if (event.message.role === "assistant") lastAssistant = event.message;
+    // 工具轮或其他扩展续跑不代表整个任务完成，不重置累计次数。
+    pendingAutoContinue = false;
+  });
+  pi.on("agent_before_settle", (event, ctx) => {
+    pendingAutoContinue = false;
+    const errorMessage = lastAssistant?.errorMessage ?? "";
+    // 此边界位于宿主重试、压缩和排队工作之后；不在每次 agent_end 时抢先续跑。
+    if (event.outcome !== "error" || event.continue || event.context.pendingMessages.length > 0 ||
+        ctx.hasPendingMessages() || ctx.signal?.aborted || lastAssistant?.stopReason !== "error" ||
+        !TOKEN_RATE_LIMIT.test(errorMessage) || TERMINAL_LIMIT_ERROR.test(errorMessage)) return;
+    if (autoContinues >= MAX_AUTO_CONTINUES) {
+      ctx.ui.notify(`自动继续 ${MAX_AUTO_CONTINUES} 次已耗尽，请手动处理限流。`, "warning");
+      return;
+    }
+    pendingAutoContinue = true;
+  });
+  pi.on("agent_settled", (event, ctx) => {
+    const shouldContinue = pendingAutoContinue;
+    pendingAutoContinue = false;
+    if (event.aborted || ctx.signal?.aborted || !ctx.isIdle() || ctx.hasPendingMessages()) {
+      resetAutoContinue();
+      return;
+    }
+    if (!shouldContinue) {
+      // 发送后到下一轮响应前没有最终结果；重复 settled 通知不能清零当前预算。
+      if (lastAssistant) resetAutoContinue();
+      return;
+    }
+    autoContinues++;
+    expectingAutoInput = true;
+    lastAssistant = undefined;
+    try {
+      // 宿主会将 settled 期间提交的消息延后启动，避免异步入队与结束边界竞争。
+      pi.sendUserMessage("继续", { deliverAs: "followUp" });
+      ctx.ui.notify(`原生重试已结束，已自动发送：继续（${autoContinues}/${MAX_AUTO_CONTINUES}）。`, "info");
+    } catch {
+      resetAutoContinue();
+      ctx.ui.notify("自动发送“继续”失败，已停止自动续跑。", "error");
+    }
+  });
 
   pi.on("before_provider_request", (event, ctx) => {
     // 无法确认端点时不猜测中转来源，避免改写其他供应商的历史推理。

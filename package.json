@@ -1,6 +1,6 @@
 {
   "name": "pi-upstream-filter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "MIT",
   "repository": {
@@ -29,7 +29,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test tests/filter.test.cjs tests/reload.test.cjs",
+    "test": "node --test tests/filter.test.cjs tests/reload.test.cjs tests/auto-continue.test.cjs",
+    "test:host": "node --test tests/auto-continue-host.test.cjs",
     "check": "node --check filter-core.cjs"
   }
 }
