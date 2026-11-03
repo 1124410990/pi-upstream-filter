@@ -1,26 +1,12 @@
 /**
- * Pi 上游过滤扩展（pi-upstream-filter）
- *
- * 借鉴 ccswitch-codex-filter（Codex 专用外部代理）的思路，改为 Pi 进程内实现：
- * 通过 before_provider_request 扩展事件在每次模型请求发出前改写请求体，
- * 删除与上游资源绑定的历史推理内容，避免 CC Switch 等中转切换上游后出现
- * "created under a different resource"、密文解密失败、thinking 签名校验失败等问题。
- *
- * - openai-responses（GPT 系）：删历史 reasoning 项、清历史记录顶层 id（保留 call_id）、
- *   清 include 中的 reasoning.encrypted_content、store:false。
- * - anthropic-messages（Claude 系）：删历史 assistant 消息的 thinking/redacted_thinking 块。
- * - 其他 API 的请求体原样放行。
- *
- * 请求体过滤仅对 agentrouter.org、ps.air-outer.com 的 HTTPS 端点启用；其他端点原样放行。
- * Token 速率限流在宿主重试耗尽后最多自动发送 5 次“继续”，不受过滤域名限制。
- * 无端口、无后台进程；修改后 /reload 即生效。/filter 查看统计，/filter responses|anthropic on|off 切换。
- * 配置持久化在 ~/.pi/agent/pi-upstream-filter.json。
- *
- * 代价与风险：删除历史推理会丢失模型前轮的内部推理状态，可能影响复杂任务连续性；
- * 严格按规范要求 reasoning 块的上游可能对缺少 reasoning 的 function_call 报错。
- * 请以 /filter 统计随真实请求增长、且会话正常完成为接入依据。
+ * Pi 上游错误恢复扩展（pi-upstream-filter）。
+ * 正常请求原样放行；明确的密文/签名/跨资源错误后只清理一次请求副本，
+ * 使用 agent_before_settle + context_edit 续跑原任务，不发送用户“继续”。
+ * 仅处理两个 HTTPS 白名单端点，保留本轮推理、include/store 和历史文件。
+ * Token 限流自动继续独立运行，规则不变。/filter 查看统计与协议开关。
  */
 
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 
 interface UiLike {
@@ -31,11 +17,37 @@ interface AssistantMessageLike {
   role: string;
   stopReason?: string;
   errorMessage?: string;
+  provider?: string;
+  model?: string;
+  api?: string;
+}
+
+type Rejection = import("./filter-core.cjs").CompatibilityRejection;
+type FilterResult = import("./filter-core.cjs").FilterResult;
+type FilterTarget = "responses" | "anthropic";
+
+interface BoundaryDraftLike {
+  type: string;
+  targetId?: string;
+  replacement?: unknown;
+}
+
+interface RequestLike {
+  key: string;
+  target: FilterTarget;
+  payload: unknown;
+  status?: number;
+  filtered: boolean;
 }
 
 interface EventContextLike {
   ui: UiLike;
-  model?: { baseUrl?: string };
+  model?: { baseUrl?: string; provider?: string; id?: string; api?: string };
+  sessionManager?: {
+    buildSessionProjection(): {
+      entries: { sourceEntry: { id: string }; messages: AssistantMessageLike[] }[];
+    };
+  };
   isIdle(): boolean;
   hasPendingMessages(): boolean;
   signal?: AbortSignal;
@@ -45,15 +57,24 @@ interface ExtensionEventsLike {
   before_provider_request: { type: "before_provider_request"; payload: unknown };
   input: { source: string; text: string };
   before_agent_start: { messageType: "user" | "custom" };
-  turn_end: { message: AssistantMessageLike };
+  turn_start: unknown;
+  after_provider_response: { status: number };
+  turn_end: { message: AssistantMessageLike; messageEntryId?: string };
   agent_before_settle: {
     outcome: "completed" | "aborted" | "error";
     continue: boolean;
-    context: { pendingMessages: unknown[] };
+    entries?: BoundaryDraftLike[];
+    context: {
+      pendingMessages: unknown[];
+      contextEntries?: { sourceEntry: { id: string }; messages: AssistantMessageLike[] }[];
+    };
   };
   agent_settled: { aborted: boolean };
   session_start: unknown;
   session_shutdown: unknown;
+  model_select: unknown;
+  session_tree: unknown;
+  session_compact: unknown;
 }
 
 interface ExtensionApiLike {
@@ -78,11 +99,16 @@ interface FilterConfig {
 
 interface Totals {
   requests: number;
+  passedRequests: number;
+  compatibleErrors: number;
+  recoveryAttempts: number;
+  recoverySuccesses: number;
+  recoveryFailures: number;
+  recoverySkipped: number;
   responsesRequests: number;
   anthropicRequests: number;
   removedReasoningItems: number;
   removedItemIds: number;
-  removedIncludeEntries: number;
   removedThinkingBlocks: number;
   warnings: number;
   errors: number;
@@ -145,11 +171,16 @@ async function saveConfig(config: FilterConfig): Promise<void> {
 function newTotals(): Totals {
   return {
     requests: 0,
+    passedRequests: 0,
+    compatibleErrors: 0,
+    recoveryAttempts: 0,
+    recoverySuccesses: 0,
+    recoveryFailures: 0,
+    recoverySkipped: 0,
     responsesRequests: 0,
     anthropicRequests: 0,
     removedReasoningItems: 0,
     removedItemIds: 0,
-    removedIncludeEntries: 0,
     removedThinkingBlocks: 0,
     warnings: 0,
     errors: 0,
@@ -169,6 +200,7 @@ export default async function (pi: ExtensionApiLike) {
     filterResponsesPayload,
     looksLikeAnthropicPayload,
     looksLikeResponsesPayload,
+    classifyCompatibilityError,
   } = require(corePath) as typeof import("./filter-core.cjs");
   const fs = await import("node:fs");
   const config = await loadConfig();
@@ -179,6 +211,47 @@ export default async function (pi: ExtensionApiLike) {
   let lastAssistant: AssistantMessageLike | undefined;
   let pendingAutoContinue = false;
   let expectingAutoInput = false;
+  let lastRequest: RequestLike | undefined;
+  let candidate: { request: RequestLike; rejection: Rejection; entryId?: string } | undefined;
+  let recovery: { key: string; target: FilterTarget; rejection: Rejection; contextKey: string } | undefined;
+  let recoveryUsed = false;
+
+  const modelKey = (ctx: EventContextLike) => JSON.stringify([
+    ctx.model?.baseUrl, ctx.model?.provider, ctx.model?.id, ctx.model?.api,
+  ]);
+  const contextKey = (entries: { sourceEntry: { id: string }; messages: AssistantMessageLike[] }[]) =>
+    createHash("sha256").update(JSON.stringify(entries.flatMap((entry) => {
+      const messages = entry.messages.filter((message) => message.role !== "system");
+      return messages.length ? [{ id: entry.sourceEntry.id, messages }] : [];
+    }))).digest("hex");
+  const resetRecovery = () => {
+    lastRequest = undefined;
+    candidate = undefined;
+    recovery = undefined;
+    recoveryUsed = false;
+  };
+  const clean = (request: RequestLike, rejection: Rejection): FilterResult =>
+    request.target === "responses"
+      ? filterResponsesPayload(request.payload, rejection)
+      : filterAnthropicPayload(request.payload);
+  const removedCount = (result: FilterResult) =>
+    (result.stats.removedReasoningItems ?? 0) + (result.stats.removedItemIds ?? 0) +
+    (result.stats.removedThinkingBlocks ?? 0);
+  const log = (action: string, data: Record<string, unknown> = {}) =>
+    appendDebugLog({ ts: new Date().toISOString(), action, ...data });
+  const filterError = (ctx: EventContextLike) => {
+    totals.errors++;
+    ctx.ui.notify("错误恢复过滤器异常，保留原请求并停止本次恢复。", "error");
+    log("filter-error");
+  };
+
+  pi.on("model_select", resetRecovery);
+  pi.on("session_tree", resetRecovery);
+  pi.on("session_compact", resetRecovery);
+  pi.on("turn_start", () => { lastRequest = undefined; candidate = undefined; });
+  pi.on("after_provider_response", (event) => {
+    if (lastRequest) lastRequest.status = event.status;
+  });
 
   const resetAutoContinue = () => {
     autoContinues = 0;
@@ -188,9 +261,10 @@ export default async function (pi: ExtensionApiLike) {
     expectingAutoInput = false;
   };
 
-  pi.on("session_start", resetAutoContinue);
-  pi.on("session_shutdown", resetAutoContinue);
+  pi.on("session_start", () => { resetAutoContinue(); resetRecovery(); });
+  pi.on("session_shutdown", () => { resetAutoContinue(); resetRecovery(); });
   pi.on("input", (event) => {
+    resetRecovery();
     const ownContinue = expectingAutoInput && event.source === "extension" && event.text === "继续";
     if (!ownContinue) resetAutoContinue();
     expectingAutoInput = false;
@@ -198,11 +272,42 @@ export default async function (pi: ExtensionApiLike) {
     pendingAutoContinue = false;
   });
   pi.on("before_agent_start", (event) => {
+    resetRecovery();
     if (event.messageType !== "user") resetAutoContinue();
     lastAssistant = undefined;
     pendingAutoContinue = false;
   });
-  pi.on("turn_end", (event) => {
+  pi.on("turn_end", (event, ctx) => {
+    const request = lastRequest;
+    lastRequest = undefined;
+    candidate = undefined;
+    const message = event.message;
+    if (request && request.key === modelKey(ctx) &&
+        (!message.provider || message.provider === ctx.model?.provider) &&
+        (!message.model || message.model === ctx.model?.id) &&
+        (!message.api || message.api === ctx.model?.api)) {
+      if (request.filtered) {
+        if (message.stopReason === "error" || message.stopReason === "aborted") {
+          totals.recoveryFailures++;
+          ctx.ui.notify("清理重试未成功，不再为本次失败安排剥离重试。", "warning");
+          log("recovery-failed");
+        } else {
+          totals.recoverySuccesses++;
+          ctx.ui.notify("上游兼容性错误已恢复；下一次请求仍原样发送。", "info");
+          log("recovery-success");
+        }
+      }
+      if (message.stopReason === "error") {
+        const rejection = classifyCompatibilityError(message.errorMessage, request.payload, request.status);
+        if (rejection) {
+          totals.compatibleErrors++;
+          log("compatibility-error", { kind: rejection.kind });
+          if (!recoveryUsed) candidate = { request, rejection, entryId: event.messageEntryId };
+        }
+      } else if (message.stopReason !== "aborted") {
+        recoveryUsed = false;
+      }
+    }
     if (event.message.role === "assistant") {
       lastAssistant = event.message;
       // 自动继续得到成功响应说明限流已恢复：重置预算，后续新中断从头计数。
@@ -216,6 +321,50 @@ export default async function (pi: ExtensionApiLike) {
   });
   pi.on("agent_before_settle", (event, ctx) => {
     pendingAutoContinue = false;
+    const pending = candidate;
+    candidate = undefined;
+    if (pending && !recoveryUsed && event.outcome === "error" && !event.continue &&
+        event.context.pendingMessages.length === 0 && !ctx.hasPendingMessages() &&
+        !ctx.signal?.aborted && pending.request.key === modelKey(ctx) && config[pending.request.target]) {
+      recoveryUsed = true;
+      try {
+        const result = clean(pending.request, pending.rejection);
+        totals.warnings += result.stats.warnings ?? 0;
+        if (removedCount(result) === 0) {
+          totals.recoverySkipped++;
+          ctx.ui.notify("兼容性错误没有可安全清理的历史状态，未重试。", "warning");
+          log("recovery-skipped", { kind: pending.rejection.kind });
+          return;
+        }
+        // 使用宿主的公开边界草稿排除失败响应；不改原始消息、不添加用户输入。
+        const entries = event.context.contextEntries;
+        const failed = entries?.find((entry) => entry.sourceEntry.id === pending.entryId);
+        const remaining = entries?.flatMap((entry) =>
+          entry === failed ? [] : entry.messages).filter((message) => message.role !== "system");
+        if (!pending.entryId || !failed || !remaining?.length || remaining.at(-1)?.role === "assistant") {
+          totals.recoverySkipped++;
+          ctx.ui.notify("无法确认原任务的可续跑上下文，未安排清理重试。", "warning");
+          log("recovery-skipped-context");
+          return;
+        }
+        recovery = {
+          key: pending.request.key, target: pending.request.target, rejection: pending.rejection,
+          contextKey: contextKey(entries!.filter((entry) => entry !== failed)),
+        };
+        log("recovery-scheduled", { kind: pending.rejection.kind });
+        ctx.ui.notify(`检测到 ${pending.rejection.kind}，将清理历史状态并重试原任务一次。`, "info");
+        return {
+          entries: [...(event.entries ?? []), {
+            type: "context_edit", targetId: pending.entryId, replacement: null,
+          }],
+          continue: true,
+        };
+      } catch {
+        recovery = undefined;
+        filterError(ctx);
+        return;
+      }
+    }
     const errorMessage = lastAssistant?.errorMessage ?? "";
     // 此边界位于宿主重试、压缩和排队工作之后；不在每次 agent_end 时抢先续跑。
     if (event.outcome !== "error" || event.continue || event.context.pendingMessages.length > 0 ||
@@ -228,6 +377,7 @@ export default async function (pi: ExtensionApiLike) {
     pendingAutoContinue = true;
   });
   pi.on("agent_settled", (event, ctx) => {
+    resetRecovery();
     const shouldContinue = pendingAutoContinue;
     pendingAutoContinue = false;
     if (event.aborted || ctx.signal?.aborted || !ctx.isIdle() || ctx.hasPendingMessages()) {
@@ -254,41 +404,56 @@ export default async function (pi: ExtensionApiLike) {
   });
 
   pi.on("before_provider_request", (event, ctx) => {
-    // 无法确认端点时不猜测中转来源，避免改写其他供应商的历史推理。
+    const attempt = recovery;
+    recovery = undefined;
+    lastRequest = undefined;
     if (!matchesFilterEndpoint(ctx.model?.baseUrl)) return undefined;
     const payload = event.payload;
+    const target = looksLikeResponsesPayload(payload) ? "responses"
+      : looksLikeAnthropicPayload(payload) ? "anthropic" : undefined;
+    if (!target || !config[target]) return undefined;
+    const request: RequestLike = { key: modelKey(ctx), target, payload, filtered: false };
+    lastRequest = request;
+    totals.requests++;
     try {
-      let result: { payload: unknown; stats: Record<string, number> } | undefined;
-      if (config.responses && looksLikeResponsesPayload(payload)) {
-        result = filterResponsesPayload(payload);
-      } else if (config.anthropic && looksLikeAnthropicPayload(payload)) {
-        result = filterAnthropicPayload(payload);
+      // 后加载的扩展可能加入新工作或改写既有内容；只清理相同的原任务投影。
+      const projection = attempt ? ctx.sessionManager?.buildSessionProjection() : undefined;
+      if (!attempt || attempt.key !== request.key || attempt.target !== target || !projection ||
+          attempt.contextKey !== contextKey(projection.entries) ||
+          ctx.signal?.aborted || ctx.hasPendingMessages()) {
+        totals.passedRequests++;
+        log("pass", { target });
+        return undefined;
       }
-      if (!result) return undefined;
+      const result = clean(request, attempt.rejection);
+      if (removedCount(result) === 0) {
+        totals.passedRequests++;
+        totals.recoverySkipped++;
+        ctx.ui.notify("恢复请求已无可清理内容，原样发送，不再追加恢复。", "warning");
+        log("recovery-no-change");
+        return undefined;
+      }
       const s = result.stats;
-      totals.requests++;
+      request.filtered = true;
+      totals.recoveryAttempts++;
       totals.responsesRequests += s.responsesRequests ?? 0;
       totals.anthropicRequests += s.anthropicRequests ?? 0;
       totals.removedReasoningItems += s.removedReasoningItems ?? 0;
       totals.removedItemIds += s.removedItemIds ?? 0;
-      totals.removedIncludeEntries += s.removedIncludeEntries ?? 0;
       totals.removedThinkingBlocks += s.removedThinkingBlocks ?? 0;
-      totals.warnings += s.warnings ?? 0;
-      if ((s.responsesRequests ?? 0) + (s.anthropicRequests ?? 0) > 0) {
-        totals.lastFilteredAt = new Date().toISOString();
-      }
-      appendDebugLog({ ts: new Date().toISOString(), ...s });
+      totals.lastFilteredAt = new Date().toISOString();
+      if (s.warnings) ctx.ui.notify("部分纯 thinking 消息无法安全清理，已保留原样。", "warning");
+      log("filter", { kind: attempt.rejection.kind, ...s });
       return result.payload;
     } catch {
-      // 过滤逻辑本身出错：保留原请求体放行（不阻断会话），
-      // runner 会向用户报告该扩展错误，这里再计数供 /filter 检查。
-      totals.errors++;
+      totals.passedRequests++;
+      filterError(ctx);
       return undefined;
     }
   });
 
   pi.registerCommand("filter", {
-    description: "查看/设置上游过滤（ responses | anthropic on|off ）",
+    description: "查看/设置错误后恢复（ responses | anthropic on|off ）",
     handler: async (args, ctx) => {
       const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
       if (parts.length >= 2) {
@@ -302,10 +467,11 @@ export default async function (pi: ExtensionApiLike) {
           ctx.ui.notify("用法：/filter responses|anthropic on|off", "warning");
           return;
         }
+        resetRecovery();
         config[target] = value;
         try {
           await saveConfig(config);
-          ctx.ui.notify(`上游过滤 ${target} = ${value ? "on" : "off"}（已保存）`, "info");
+          ctx.ui.notify(`错误后恢复 ${target} = ${value ? "on" : "off"}（已保存）`, "info");
         } catch (error) {
           ctx.ui.notify(
             `已切换 ${target} = ${value ? "on" : "off"}，但保存配置失败：${error instanceof Error ? error.message : String(error)}`,
@@ -320,11 +486,12 @@ export default async function (pi: ExtensionApiLike) {
       }
       const lines = [
         `域名白名单（仅 HTTPS、精确匹配）：${FILTER_HOSTS.join(", ")}`,
-        `上游过滤状态：responses=${config.responses ? "on" : "off"}  anthropic=${config.anthropic ? "on" : "off"}`,
-        `本会话已过滤请求：${totals.requests}（responses=${totals.responsesRequests}, anthropic=${totals.anthropicRequests}）`,
+        `错误后恢复状态：responses=${config.responses ? "on" : "off"}  anthropic=${config.anthropic ? "on" : "off"}`,
+        `本会话白名单启用协议请求：${totals.requests}；原样放行：${totals.passedRequests}`,
+        `兼容性错误：${totals.compatibleErrors}；清理重试：${totals.recoveryAttempts}（responses=${totals.responsesRequests}, anthropic=${totals.anthropicRequests}）`,
+        `  恢复成功：${totals.recoverySuccesses}  失败：${totals.recoveryFailures}  未安排/未清理：${totals.recoverySkipped}`,
         `  删除历史 reasoning 项：${totals.removedReasoningItems}`,
         `  清理历史记录 id：${totals.removedItemIds}`,
-        `  删除 include 密文项：${totals.removedIncludeEntries}`,
         `  删除 thinking 块：${totals.removedThinkingBlocks}`,
         `  警告：${totals.warnings}  过滤错误：${totals.errors}`,
         `  最后过滤时间：${totals.lastFilteredAt ?? "无"}`,

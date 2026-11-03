@@ -13,8 +13,7 @@
  * 2. anthropic-messages（Claude 系）：历史 assistant 消息回传 thinking 块 +
  *    signature；签名与上游账号绑定，切换上游后校验失效。
  *
- * 其余 API（openai-completions、google、mistral、bedrock 等）的请求体不含
- * 上游绑定资源，不做处理。
+ * 其余 API 不在本扩展的处理范围内，不做处理。
  */
 
 const RESPONSES_ID_ITEM_TYPES = new Set([
@@ -56,31 +55,73 @@ function looksLikeAnthropicPayload(payload) {
 }
 
 /**
- * 过滤 openai-responses 请求体。
- * - 删除 input 中所有历史 type:"reasoning" 项（密文 + rs_ ID）。
- * - 删除历史记录项的顶层 id；保留 call_id（工具配对必需）、name、arguments、output、phase。
- * - include 中删除 reasoning.encrypted_content；store 固定 false。
- * - 保留 reasoning.effort/summary（本轮推理强度）、tools、instructions、prompt_cache_key。
- * - 不认识的 item 类型原样保留：若未来出现 item_reference 等服务器资源引用，
- *   让上游报错（大声失败）而不是静默剥离丢上下文。
+ * 只识别上游明确点名的兼容性错误；状态码、invalid request 本身不是触发依据。
+ * HTTP 200 可承载 SSE 错误；缺失状态时仅接受 SDK 的行首状态码/格式化前缀。
  */
-function filterResponsesPayload(payload) {
+function classifyCompatibilityError(errorMessage, payload, status) {
+  if (typeof errorMessage !== "string" || !errorMessage) return undefined;
+  const prefixStatus = /^\s*(?:[^\n]* API error \((\d{3})\):|(\d{3})\b)/.exec(errorMessage);
+  const httpStatus = status ?? (prefixStatus ? Number(prefixStatus[1] ?? prefixStatus[2]) : undefined);
+  if (httpStatus !== undefined && httpStatus !== 200 &&
+      (httpStatus < 400 || httpStatus >= 500 || [401, 403, 429].includes(httpStatus))) return undefined;
+  const text = errorMessage.toLowerCase();
+  if (/authentication|authorization|invalid api key|insufficient_quota|quota exceeded|billing|available balance|rate[\s_-]*limit|too many requests|timeout|connection refused/.test(text)) {
+    return undefined;
+  }
+  if (looksLikeResponsesPayload(payload)) {
+    if (text.includes("created under a different") && text.includes("resource")) {
+      return { kind: "responses-resource", reasoning: true, itemIds: true };
+    }
+    const invalidId = /invalid\s+['`"]input\[(\d+)\]\.id['`"][\s\S]*expected an id that begins with/.exec(text);
+    if (invalidId) {
+      return { kind: "responses-id", reasoning: false, itemIds: true, itemIndex: Number(invalidId[1]) };
+    }
+    if (/\binvalid_encrypted_content\b/.test(text) ||
+        (text.includes("encrypted content") && text.includes("could not be verified")) ||
+        (text.includes("was not issued to this caller") && /encrypted_content|reasoning/.test(text)) ||
+        (text.includes("encrypted_content") && /could not decrypt|could not be decrypted/.test(text)) ||
+        (text.includes("not found") && text.includes("items are not persisted when") && /\brs_/.test(text))) {
+      return { kind: "responses-encrypted", reasoning: true, itemIds: false };
+    }
+  } else if (looksLikeAnthropicPayload(payload)) {
+    if ((text.includes("signature") && /thinking|thought/.test(text) &&
+         /invalid|not valid|verification failed/.test(text)) ||
+        (/\bsignature\b/.test(text) && /field required|extra inputs are not permitted/.test(text) &&
+         /messages[.\[]|thinking/.test(text))) {
+      return { kind: "anthropic-signature" };
+    }
+    if ((/thinking|redacted_thinking/.test(text) && text.includes("cannot be modified")) ||
+        text.includes("must start with a thinking block") ||
+        (text.includes("expected") && /thinking|redacted_thinking/.test(text) &&
+         text.includes("found") && text.includes("tool_use"))) {
+      return { kind: "anthropic-thinking" };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 仅在错误恢复时清理 Responses 历史状态，不修改 include/store/本轮 reasoning。
+ * 密文错误只移除 reasoning；跨资源错误同时清理已知记录的 id；格式错误只清理点名项。
+ * 未知类型（包括 item_reference）保留，不能通过删除唯一引用来丢弃上下文。
+ */
+function filterResponsesPayload(payload, options = { reasoning: true, itemIds: false }) {
   const stats = {
     responsesRequests: 0,
     removedReasoningItems: 0,
     removedItemIds: 0,
-    removedIncludeEntries: 0,
   };
   if (!looksLikeResponsesPayload(payload)) {
     return { payload, stats };
   }
   const kept = [];
-  for (const item of payload.input) {
-    if (isPlainObject(item) && item.type === "reasoning") {
+  for (const [index, item] of payload.input.entries()) {
+    if (options.reasoning && isPlainObject(item) && item.type === "reasoning") {
       stats.removedReasoningItems++;
       continue;
     }
     if (
+      options.itemIds && (options.itemIndex === undefined || options.itemIndex === index) &&
       isPlainObject(item) &&
       RESPONSES_ID_ITEM_TYPES.has(item.type) &&
       typeof item.id === "string" &&
@@ -93,14 +134,9 @@ function filterResponsesPayload(payload) {
     }
     kept.push(item);
   }
-  const next = { ...payload, input: kept, store: false };
-  if (Array.isArray(next.include)) {
-    const include = next.include.filter((entry) => entry !== "reasoning.encrypted_content");
-    stats.removedIncludeEntries = next.include.length - include.length;
-    next.include = include;
-  }
   stats.responsesRequests = 1;
-  return { payload: next, stats };
+  const changed = stats.removedReasoningItems + stats.removedItemIds > 0;
+  return { payload: changed ? { ...payload, input: kept } : payload, stats };
 }
 
 /**
@@ -108,9 +144,8 @@ function filterResponsesPayload(payload) {
  * - 删除 assistant 消息中所有 thinking / redacted_thinking 块（含 signature）。
  * - 保留 text / tool_use / image 块与 user / tool_result 消息。
  * - 保留 system、tools、thinking:{type:"enabled"}（本轮推理强度）。
- * - 过滤后 content 为空、而原来非空的 assistant 消息（极端情况：纯 thinking 轮）
- *   整条跳过并计入 warnings——删除该消息会破坏 tool_use/tool_result 配对，
- *   污染上下文也不可取，保留原样最安全。
+ * - 过滤后 content 为空的 assistant 消息保留原样并计入 warnings，
+ *   不发送空消息，不把实际保留的块计入删除数量。
  */
 function filterAnthropicPayload(payload) {
   const stats = {
@@ -126,19 +161,16 @@ function filterAnthropicPayload(payload) {
     if (!isPlainObject(msg) || msg.role !== "assistant" || !Array.isArray(msg.content)) {
       return msg;
     }
-    const content = msg.content.filter((block) => {
-      if (isPlainObject(block) && (block.type === "thinking" || block.type === "redacted_thinking")) {
-        stats.removedThinkingBlocks++;
-        changed = true;
-        return false;
-      }
-      return true;
-    });
+    const content = msg.content.filter((block) =>
+      !isPlainObject(block) || (block.type !== "thinking" && block.type !== "redacted_thinking"));
     if (content.length === 0 && msg.content.length > 0) {
       stats.warnings++;
       return msg;
     }
-    return content.length === msg.content.length ? msg : { ...msg, content };
+    if (content.length === msg.content.length) return msg;
+    stats.removedThinkingBlocks += msg.content.length - content.length;
+    changed = true;
+    return { ...msg, content };
   });
   stats.anthropicRequests = 1;
   return { payload: changed ? { ...payload, messages } : payload, stats };
@@ -149,6 +181,7 @@ module.exports = {
   matchesFilterEndpoint,
   looksLikeResponsesPayload,
   looksLikeAnthropicPayload,
+  classifyCompatibilityError,
   filterResponsesPayload,
   filterAnthropicPayload,
 };

@@ -14,7 +14,7 @@ const {createJiti} = piDir
   : require("jiti");
 
 for (const tryNative of [true, false]) {
-  test(`旧版 CJS 导出已缓存后，重载仍能显示白名单并过滤请求（tryNative=${tryNative}）`, async () => {
+  test(`旧版 CJS 导出已缓存后，重载仍能显示白名单并在错误后恢复请求（tryNative=${tryNative}）`, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-filter-reload-"));
     const originalDir = path.resolve(__dirname, "..");
     const savedDir = process.env.PI_CODING_AGENT_DIR;
@@ -55,16 +55,34 @@ for (const tryNative of [true, false]) {
       };
       const snapshot = JSON.stringify(payload);
       const handle = handlers.get("before_provider_request");
+      const ctx = baseUrl => ({
+        model: {baseUrl}, ui: {notify: () => {}}, hasPendingMessages: () => false,
+        sessionManager: {buildSessionProjection: () => ({entries: [
+          {sourceEntry: {id: "user"}, messages: [{role: "user"}]},
+        ]})},
+      });
       for (const baseUrl of ["https://agentrouter.org/v1", "https://ps.air-outer.com/v1"]) {
-        const result = await handle({payload}, {model: {baseUrl}});
+        const context = ctx(baseUrl);
+        await handlers.get("session_start")();
+        assert.equal(await handle({payload}, context), undefined, "首次必须原样发送");
+        await handlers.get("turn_end")({messageEntryId: "failed", message: {
+          role: "assistant", stopReason: "error", errorMessage: "created under a different Azure OpenAI resource",
+        }}, context);
+        const proposal = await handlers.get("agent_before_settle")({outcome: "error", continue: false, entries: [],
+          context: {pendingMessages: [], contextEntries: [
+            {sourceEntry: {id: "user"}, messages: [{role: "user"}]},
+            {sourceEntry: {id: "failed"}, messages: [{role: "assistant"}]},
+          ]}}, context);
+        assert.equal(proposal.continue, true);
+        const result = await handle({payload}, context);
         assert.equal(result.input.length, 2);
         assert.equal(result.input[0].id, undefined);
         assert.equal(result.input[0].call_id, result.input[1].call_id);
-        assert.deepEqual(result.include, []);
+        assert.deepEqual(result.include, payload.include);
         assert.deepEqual(result.reasoning, payload.reasoning);
       }
       for (const baseUrl of ["https://open.bigmodel.cn/api/anthropic", "https://agentrouter.org.evil.test", undefined]) {
-        assert.equal(await handle({payload}, {model: {baseUrl}}), undefined);
+        assert.equal(await handle({payload}, ctx(baseUrl)), undefined);
       }
       assert.equal(JSON.stringify(payload), snapshot);
     } finally {

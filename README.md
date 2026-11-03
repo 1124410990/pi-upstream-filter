@@ -1,8 +1,20 @@
 # pi-upstream-filter
 
-用于 Pi 的进程内请求过滤扩展，借鉴 `ccswitch-codex-filter` 的历史推理与记录 ID 清理思路。无需监听端口、后台进程或额外运行时依赖。
+用于 Pi 的进程内兼容性错误恢复扩展，借鉴 CC Switch 的“报错后整流重试”思路。无需监听端口、后台进程或额外运行时依赖。
 
 > 这是兼容性规避方案，不是密文解密工具，也不保证解决全部 Azure OpenAI 400 错误。删除历史内部推理状态可能影响复杂任务的连续表现。
+
+## v0.3.0（源码版本，尚未创建发布标签）
+
+从“每次请求主动剥离”改为“正常请求原样发送，明确兼容性错误后清理重试一次”。
+
+- 不再删除 `include` 中的 `reasoning.encrypted_content`，不再改写 `store`。
+- 密文错误只移除历史 reasoning；Azure 跨资源错误才额外清理已知 item ID；ID 格式错误只清理点名项。
+- 利用 Pi 的公开结束边界续跑原任务，不额外发送用户“继续”，不改历史推理内容。
+- `/filter` 区分原样放行、兼容性错误、清理尝试及恢复结果。
+- Token 限流自动继续的五次预算规则保持不变。
+
+`package.json` 已设为 0.3.0，当前分支源码包含新行为，尚未创建对应 Git 发布标签。下面的 v0.2.1 标签安装仍是旧行为，试用新行为请获取当前分支源码后本地加载。
 
 ## v0.2.1
 
@@ -16,30 +28,45 @@
 
 目前离线验证环境：Windows、Node.js 22.22.3、`@earendil-works/pi-coding-agent` 1.4.0（最低 Node.js 版本按宿主要求为 22.19.0）。其他 Pi 发行版、版本和操作系统尚未验证；当前路径处理按 Windows 实现。
 
-仅在 Pi 当前模型的 `baseUrl` 精确匹配以下 HTTPS 域名时过滤：
+仅在 Pi 当前模型的 `baseUrl` 精确匹配以下 HTTPS 域名时允许错误后恢复：
 
 - `agentrouter.org`
 - `ps.air-outer.com`
 
 支持 `/v1` 等 URL 路径，不匹配其他子域名、伪装域名或 HTTP 端点。若 `baseUrl` 指向 localhost 的 CCSwitch 代理，无法自动识别其后端供应商，因此原样放行。模型路由、动态认证端点覆盖及嵌套模型调用尚未验证。
 
-## 过滤内容
+## 错误后一次性恢复
 
-| 请求类型 | 处理 |
+1. 每次新请求先原样发送，保留历史密文、签名和记录 ID。
+2. `turn_end` 记录明确的兼容性错误，等待宿主原生重试、压缩和排队工作结束。
+3. 在 `agent_before_settle` 确认仍是原任务且有安全可清理内容，通过 `context_edit` 排除**失败响应**，再请求一次上下文续跑。原始失败响应仍保留在原始会话记录、UI 和计费统计中。
+4. 仅对这一次恢复请求清理历史状态；同一失败链不再追加第二次剥离重试。成功后下一请求再次原样发送。
+
+| 错误 / 请求 | 恢复请求处理 |
 | --- | --- |
-| Responses（顶层 `input` 数组） | 删除历史 `reasoning` 项；清理普通消息和函数/自定义工具记录的顶层 `id`；从 `include` 删除 `reasoning.encrypted_content`；设置 `store:false` |
-| Anthropic Messages（顶层 `messages` 和 `system`） | 删除历史 assistant 消息的 `thinking` / `redacted_thinking` 块；若删除后消息为空，保留原消息并记录警告 |
-| 其他请求类型或非白名单端点 | 原样放行 |
+| Responses 密文错误：`invalid_encrypted_content`、明确的密文无法验证/解密、密文非当前身份签发、`rs_` 项在 `store:false` 下未保存 | 移除历史 `reasoning` 项，保留其他有效记录 ID |
+| Responses 跨资源错误：`created under a different … resource` | 移除历史 `reasoning`，清理普通消息及函数/自定义工具记录的顶层 `id` |
+| Responses ID 格式错误：明确点名 `input[N].id` 和所需前缀 | 只清理点名的已知记录项 ID，不移除 reasoning |
+| Anthropic Messages 签名无效、thinking 块不可修改、工具链缺少 thinking 前缀等明确错误 | 删除历史 assistant 的 `thinking` / `redacted_thinking`；若会产生空消息，保留该消息并告警 |
+| 正常请求、普通参数错误、网络/超时、401/403、429、5xx、其他协议或非白名单端点 | 不剥离；宿主自己的重试规则不变 |
 
-保留本轮推理配置、消息内容、工具参数和结果、`call_id` / 工具结果关联及嵌套文件资源 ID。只修改请求副本，不重写 Pi 历史文件或响应流。
+支持普通 HTTP 错误和 HTTP 200 内由宿主规范化的 SSE 错误。不以泛化的 `invalid request` 或单独状态码作为剥离依据；未知措辞会保留错误，不猜测。缺失 HTTP 状态时使用宿主错误文本里的固定前缀和明确措辞。
 
-以下情况仍可能失败：
+**即使在恢复请求中，也保留 `include`、`store`、本轮 `reasoning` / `thinking` 配置、消息正文、工具参数和结果、`call_id` / 工具结果关联及嵌套文件资源 ID。** 只清理请求副本，不编辑已有历史推理条目或响应流；会话仅追加失败响应的上下文排除记录。
 
-- 上游强制要求工具调用携带对应历史 reasoning。
-- `previous_response_id`、`conversation`、`item_reference`、加密 compaction 等服务器状态引用。本扩展不会把它们展开，也不会像原 Codex HTTP 代理那样主动拒绝转发。
+用户取消、人工消息排队、已有扩展续跑、模型/会话切换、压缩或关闭协议开关时撤销旧恢复状态。恢复请求前再次核对端点、模型、协议和原任务上下文摘要，避免后加载扩展的新工作继承清理。
+
+### 代价与限制
+
+- 旧的不兼容密文仍在历史里；严格“每次先原样发送”可能让后续轮次重复经历一次失败、一次清理恢复，增加延迟和请求开销。不会永久开启整个会话的剥离模式。
+- 这里只保证本扩展最多安排一次清理续跑；Pi 和供应商 SDK 对无关瞬态错误的原生重试预算不变，不能把全部 HTTP 请求数理解成最多两次。
+- 上游强制要求工具调用携带对应历史 reasoning/thinking 时，清理可能仍失败；不会偷偷关闭本轮 thinking 来换取成功。
+- `previous_response_id`、`conversation`、`item_reference`、加密 compaction 等服务器状态引用不会被展开或删除；无法安全清理时明确提示，不做无意义重试。
 - WebSocket 缓存续传可能在请求钩子之后追加状态；该场景未验证。
-- Token 速率限流：原生重试耗尽后最多自动发送 5 次“继续”，仍可能无法恢复；其他 429、配额不足、鉴权错误和服务商不可用不触发此功能。
-- 过滤器异常时保留原请求、增加错误计数，并不提供严格阻断保证。
+- 同一配置端点/模型并不保证中转内部实际后端不变；不支持推断内部账号路由。
+- 过滤器异常时保留原请求、增加错误计数并明确告警，不报告恢复成功，也不提供严格阻断保证。
+
+实现参考：[CC Switch thinking 签名整流器](https://github.com/farion1231/cc-switch/blob/7afceec14b977ecc2f4373e8ffb40e7223b435ac/src-tauri/src/proxy/thinking_rectifier.rs)、[Responses 密文整流器](https://github.com/farion1231/cc-switch/blob/7afceec14b977ecc2f4373e8ffb40e7223b435ac/src-tauri/src/proxy/opaque_state_rectifier.rs)。本扩展只移植与 Pi 请求相关的恢复思想，不照搬泛化错误兜底、关闭顶层 thinking 或 Codex 压缩状态处理。
 
 ## Token 限流自动继续
 
@@ -65,7 +92,7 @@ pi --no-extensions --extension ./index.ts
 
 `--no-extensions` 用于避免本机已安装副本与试用副本重复注册 `/filter`，仅对本次运行有效。
 
-GitHub 安装（使用本次发布的 `v0.2.1` 标签）：
+GitHub 已发布标签版本安装（`v0.2.1`，仍是始终过滤行为，不含当前源码的 0.3.0 改动）：
 
 ```text
 pi install git:github.com/1124410990/pi-upstream-filter@v0.2.1
@@ -78,9 +105,9 @@ pi install git:github.com/1124410990/pi-upstream-filter@v0.2.1
 /filter
 ```
 
-首次无配置时默认开启 Responses 和 Anthropic 过滤；已有配置中的开关保持不变。若已有手工安装副本，请先通过 `pi config` 禁用它，再安装包，避免重复命令和重复过滤。
+当前源码首次无配置时默认开启 Responses 和 Anthropic **错误后恢复**，`on` 不再表示每次剥离；已有配置中的开关保持不变。若已有手工安装副本，请先通过 `pi config` 禁用它，再安装包，避免重复命令和重复过滤。
 
-Git 标签安装是固定版本，`/reload` 不会升级旧标签。从旧版本升级请在终端执行：
+Git 标签安装是固定版本，`/reload` 不会升级旧标签。下面仅是旧发布版本之间的升级示例，**不会获得当前源码的 0.3.0 行为**：
 
 ```text
 pi remove git:github.com/1124410990/pi-upstream-filter@v0.2.0
@@ -99,7 +126,7 @@ pi install git:github.com/1124410990/pi-upstream-filter@v0.2.1
 /filter anthropic off
 ```
 
-开关保存在 `%USERPROFILE%\.pi\agent\pi-upstream-filter.json`；设置 `PI_CODING_AGENT_DIR` 时使用该目录。`/filter` 显示白名单、开关及本次扩展运行的计数。重载或重启后计数重置；开关持久化。
+开关保存在 `%USERPROFILE%\.pi\agent\pi-upstream-filter.json`；设置 `PI_CODING_AGENT_DIR` 时使用该目录。`/filter` 显示白名单、错误后恢复开关、启用协议请求/原样放行数、兼容性错误数、清理尝试与成功/失败/未清理数、实际删除数量。域名外及已关闭协议请求不计入请求统计。重载或重启后计数重置；开关持久化。
 
 白名单目前固定在 `filter-core.cjs` 的 `FILTER_HOSTS` 中。修改后同步调整域名测试，再 `/reload`。
 
@@ -134,7 +161,9 @@ npm run test:host
 npm run check
 ```
 
-普通测试包含 4 项核心测试、2 项热重载回归测试和 7 项自动继续回归测试（含成功响应重置预算与重复结束通知不重置）。`test:host` 另有 2 项真实 Pi 会话离线测试，替换模型输出且阻止联网，验证三次重试后发送、五次上限、恢复成功及取消。该命令必须设置 `PI_TEST_PACKAGE_DIR`，缺失直接报错，不静默跳过。实际供应商多轮会话、长会话压缩和完整 Pi UI 尚需自行验证。
+普通测试共 39 项（包含子测试），覆盖核心分类/清理、热重载、错误恢复状态机及原有自动继续预算。`test:host` 共 22 项（包含子测试）：新恢复套件运行真实 Pi 会话、provider、SDK 序列化与钩子链，只替换 `fetch` 返回离线 HTTP/SSE；验证正常请求保留密文、400/SSE 后一次恢复、工具配对、原历史不变、失败上限、无关原生重试及竞争取消。原自动继续套件替换模型输出且阻止联网，验证 24 次上限和恢复取消。该命令必须设置 `PI_TEST_PACKAGE_DIR`，缺失直接报错，不静默跳过。
+
+已验证的测试不调用实际供应商、不读取真实凭据。实际收费供应商多轮会话、真实压缩链路、WebSocket 和完整 Pi UI 尚未验证。
 
 ## GitHub 发布前检查
 
