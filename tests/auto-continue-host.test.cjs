@@ -83,16 +83,16 @@ async function hostHarness(t, respond) {
   return {session, errors, userCounts, calls: () => calls};
 }
 
-test("真实 Pi 会话：持续限流时三次重试与五次继续共24次请求，不产生第六条继续", {timeout: 15000}, async t => {
+test("真实 Pi 会话：持续限流时三次重试与二十次继续共84次请求，不产生第二十一条继续", {timeout: 15000}, async t => {
   const h = await hostHarness(t, () => "error");
   await h.session.prompt("完成原任务");
   await h.session.waitForIdle();
-  assert.equal(h.calls(), 24);
-  assert.deepEqual(h.userCounts, Array.from({length: 24}, (_, i) => 1 + Math.floor(i / 4)));
+  assert.equal(h.calls(), 84);
+  assert.deepEqual(h.userCounts, Array.from({length: 84}, (_, i) => 1 + Math.floor(i / 4)));
   const users = h.session.messages.filter(message => message.role === "user");
-  assert.equal(users.length, 6);
+  assert.equal(users.length, 21);
   assert.deepEqual(users.slice(1).map(message => message.content),
-    Array.from({length: 5}, () => [{type: "text", text: "继续"}]));
+    Array.from({length: 20}, () => [{type: "text", text: "继续"}]));
   assert.deepEqual(h.errors, []);
 });
 

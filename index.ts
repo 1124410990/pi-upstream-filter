@@ -116,7 +116,7 @@ interface Totals {
 }
 
 const DEFAULT_CONFIG: FilterConfig = { responses: true, anthropic: true };
-const MAX_AUTO_CONTINUES = 5;
+const MAX_AUTO_CONTINUES = 20;
 
 function agentDir(): string {
   const home = process.env.USERPROFILE || process.env.HOME || "";
@@ -310,7 +310,7 @@ export default async function (pi: ExtensionApiLike) {
     if (event.message.role === "assistant") {
       lastAssistant = event.message;
       // 自动继续得到成功响应说明限流已恢复：重置预算，后续新中断从头计数。
-      // 若继续后立刻再次限流（无任何成功响应），预算继续累计，仍受五次上限约束。
+      // 若继续后立刻再次限流（无任何成功响应），预算继续累计，仍受二十次上限约束。
       if (afterAutoContinue && event.message.stopReason !== "error" && event.message.stopReason !== "aborted") {
         autoContinues = 0;
         afterAutoContinue = false;

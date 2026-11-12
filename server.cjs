@@ -11,7 +11,7 @@
  * 与 Pi 扩展（index.ts）共用同一份 filter-core.cjs 纯函数，单一事实来源：
  * - 清理重试链：上游返回白名单兼容性错误（thinking 签名 / 加密 reasoning 校验失败）时，
  *   清理历史推理状态并立即重试一次（与 Pi 版 v0.3.0 的"错误后一次性恢复"对齐）。
- * - 限流重试链：429 / token rate limit 措辞触发带退避的有限次重放（与 Pi 版五次预算对齐），
+ * - 限流重试链：429 / token rate limit 措辞触发带退避的有限次重放（与 Pi 版二十次预算对齐），
  *   终态措辞（鉴权/配额/余额）不重试。
  *
  * 明确边界：只在尚未向客户端写出任何字节前判定重试；200 SSE 流内错误一律透传（v1）。
@@ -41,7 +41,7 @@ const VERSION = (() => {
 const DEFAULT_PORT = 8788;
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_MAX_BODY_MB = 64;
-const DEFAULT_RATE_LIMIT_MAX_RETRIES = 5;
+const DEFAULT_RATE_LIMIT_MAX_RETRIES = 20;
 const DEFAULT_BACKOFF_BASE_MS = 1000;
 const DEFAULT_BACKOFF_MAX_MS = 30_000;
 /** retry-after 的绝对上限：超过视为上游明确拒绝节奏，不再无限等待。 */

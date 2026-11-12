@@ -71,27 +71,27 @@ test("原生重试期间不发送，最终失败后提交真实的继续消息�
   assert.deepEqual(h.sent, [{content: "继续", options: {deliverAs: "followUp"}}]);
   await h.settled();
   assert.equal(h.sent.length, 1, "重复结束通知不得重复发送");
-  assert.match(h.notices[0].message, /1\/5/);
+  assert.match(h.notices[0].message, /1\/20/);
 });
 
-test("同一任务最多循环五次，第六轮失败明确提示耗尽", async () => {
+test("同一任务最多循环二十次，第二十一轮失败明确提示耗尽", async () => {
   const h = await harness();
-  for (let round = 0; round < 6; round++) {
+  for (let round = 0; round < 21; round++) {
     await h.failedRound();
-    assert.equal(h.sent.length, Math.min(round + 1, 5));
-    if (round < 5) await h.input("extension", "继续");
+    assert.equal(h.sent.length, Math.min(round + 1, 20));
+    if (round < 20) await h.input("extension", "继续");
   }
-  assert.match(h.notices.at(-1).message, /5.*耗尽|耗尽.*5/);
+  assert.match(h.notices.at(-1).message, /20.*耗尽|耗尽.*20/);
   assert.equal(h.notices.at(-1).level, "warning");
 });
 
-test("重复结束通知不能重置正在继续的任务预算，否则会突破五次上限", async () => {
+test("重复结束通知不能重置正在继续的任务预算，否则会突破二十次上限", async () => {
   const h = await harness();
-  for (let round = 0; round < 6; round++) {
+  for (let round = 0; round < 21; round++) {
     await h.failedRound();
     await h.settled();
-    assert.equal(h.sent.length, Math.min(round + 1, 5));
-    if (round < 5) await h.input("extension", "继续");
+    assert.equal(h.sent.length, Math.min(round + 1, 20));
+    if (round < 20) await h.input("extension", "继续");
   }
 });
 
@@ -101,20 +101,20 @@ test("继续后的成功响应重置预算；继续后立刻再失败仍累计�
   assert.equal(h.sent.length, 1);
   await h.input("extension", "继续");
   await h.turn({role: "assistant", stopReason: "toolUse"});
-  // 成功响应已重置预算，新中断应从 1/5 重新开始。
+  // 成功响应已重置预算，新中断应从 1/20 重新开始。
   await h.failedRound();
   assert.equal(h.sent.length, 2);
-  assert.match(h.notices.at(-1).message, /1\/5/);
+  assert.match(h.notices.at(-1).message, /1\/20/);
   // 继续后没有任何成功响应就再次限流，预算继续累计。
   await h.input("extension", "继续");
   await h.failedRound();
   assert.equal(h.sent.length, 3);
-  assert.match(h.notices.at(-1).message, /2\/5/);
+  assert.match(h.notices.at(-1).message, /2\/20/);
   // 用户手动发送继续也是新计数链。
   await h.input("interactive", "继续");
   await h.failedRound();
   assert.equal(h.sent.length, 4);
-  assert.match(h.notices.at(-1).message, /1\/5/);
+  assert.match(h.notices.at(-1).message, /1\/20/);
   // 正常完成不能发送继续。
   await h.input("extension", "继续");
   await h.turn({role: "assistant", stopReason: "stop"});
@@ -132,7 +132,7 @@ test("用户手动发送继续也是新计数链，最终完成后新任务也�
   await h.input("interactive", "继续");
   await h.failedRound();
   assert.equal(h.sent.length, 6);
-  assert.match(h.notices.at(-1).message, /1\/5/);
+  assert.match(h.notices.at(-1).message, /1\/20/);
   await h.input("extension", "继续");
   await h.turn({role: "assistant", stopReason: "stop"});
   await h.boundary("completed");
@@ -140,7 +140,7 @@ test("用户手动发送继续也是新计数链，最终完成后新任务也�
   assert.equal(h.sent.length, 6, "正常完成不能发送继续");
   await h.input("interactive", "新任务");
   await h.failedRound();
-  assert.match(h.notices.at(-1).message, /1\/5/);
+  assert.match(h.notices.at(-1).message, /1\/20/);
 });
 
 test("鉴权、余额、其他限流及正常结果不触发自动继续", async () => {

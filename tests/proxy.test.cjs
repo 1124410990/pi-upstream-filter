@@ -68,7 +68,7 @@ function startProxy(upstreamPort, overrides = {}) {
     debug: false,
     logFile: "",
     maxBodyBytes: 64 * 1024 * 1024,
-    maxRateRetries: 5,
+    maxRateRetries: 20,
     backoffBaseMs: 1,
     backoffMaxMs: 4,
     ...overrides,
@@ -145,7 +145,7 @@ test("parseConfig：缺参/非法 URL 中文报错，尾斜杠剥离，默认值
   assert.equal(config.port, 8788);
   assert.equal(config.upstreamApiKey, "");
   assert.equal(config.maxBodyBytes, 64 * 1024 * 1024);
-  assert.equal(config.maxRateRetries, 5);
+  assert.equal(config.maxRateRetries, 20);
   assert.equal(config.backoffBaseMs, 1000);
   assert.equal(config.backoffMaxMs, 30000);
   assert.equal(config.debug, false);
@@ -473,7 +473,7 @@ test("终态限流不重试：余额/鉴权措辞即便配 429 也单次透传",
   }
 });
 
-test("预算耗尽：恒 429 共 1+5 次上游调用后透传", async () => {
+test("预算耗尽：恒 429 共 1+20 次上游调用后透传", async () => {
   const upstream = await startUpstream([{
     status: 429, headers: { "content-type": "application/json" }, body: RATE_LIMIT_ERROR,
   }]);
@@ -486,8 +486,8 @@ test("预算耗尽：恒 429 共 1+5 次上游调用后透传", async () => {
     assert.equal(response.status, 429);
     assert.equal(response.body.toString(), RATE_LIMIT_ERROR);
     assert.equal(response.headers["x-upstream-filter"], "rate-exhausted");
-    assert.equal(upstream.received.length, 6); // 首次 + 5 次重放
-    assert.equal(proxyServer.stats.rateRetries, 5);
+    assert.equal(upstream.received.length, 21); // 首次 + 20 次重放
+    assert.equal(proxyServer.stats.rateRetries, 20);
     assert.equal(proxyServer.stats.rateExhausted, 1);
   } finally {
     await proxyServer.close();
