@@ -18,3 +18,6 @@ pi-filter-backup*/
 # 本地代理模式与编排工具的运行状态、npm 安装产物
 .omc/
 package-lock.json
+
+# 双击启动脚本的个人配置与日志（模板见 proxy.local.ps1.example）
+scripts/proxy.local.ps1

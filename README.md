@@ -119,6 +119,16 @@ npm run proxy
 }
 ```
 
+### 双击启动（Windows）
+
+`scripts/` 下提供无窗口常驻的启动/停止脚本：
+
+1. 复制 `scripts/proxy.local.ps1.example` 为 `scripts/proxy.local.ps1`，填好 `$UpstreamBaseUrl`（该文件已被 `.gitignore` 忽略，不会提交）；首次双击 `start-proxy.vbs` 也会自动生成并提示填写。
+2. 双击 `scripts/start-proxy.vbs` 启动（弹窗确认，后台无窗口运行，调试日志写入 `scripts/proxy.log`）；双击 `scripts/stop-proxy.vbs` 停止。
+3. 命令行等价用法：`powershell -File scripts\proxy.ps1 -Action start|stop|status`。
+
+脚本通过 `healthz` 确认启动成功；重复双击不会起第二个进程。`proxy.ps1` 为带 BOM 的 UTF-8 编码（Windows PowerShell 5.1 对无 BOM 文件按 ANSI 解析中文会乱码），编辑时请保留 BOM。
+
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
@@ -128,7 +138,7 @@ npm run proxy
 | `UPSTREAM_API_KEY` | 无 | 设定时覆写转发请求的 `authorization` / `x-api-key` |
 | `FILTER_DEBUG` / `FILTER_LOG_FILE` | 关 / 无 | 结构化 JSON 行日志（不含请求体与鉴权头），分别输出到 stderr / 文件 |
 | `MAX_BODY_MB` | `64` | 请求体缓冲上限，超限回 413 |
-| `RATE_LIMIT_MAX_RETRIES` | `5` | 每请求限流重放预算，与 Pi 五次对齐，按请求自然重置 |
+| `RATE_LIMIT_MAX_RETRIES` | `20` | 每请求限流重放预算，与 Pi 二十次对齐，按请求自然重置 |
 | `RATE_BACKOFF_BASE_MS` / `RATE_BACKOFF_MAX_MS` | `1000` / `30000` | 指数退避区间；`retry-after` 优先且封顶 60s，指数路径含 ±25% 抖动 |
 
 ### 两种上游拓扑

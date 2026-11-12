@@ -1,0 +1,11 @@
+﻿# 复制本文件为 proxy.local.ps1 并按需修改（proxy.local.ps1 已被 .gitignore 忽略，不会提交）。
+# 上游地址二选一：
+#   路线 A（推荐）：填 CC Switch 里该供应商的真实地址，代理作为 CC Switch 的一个上游条目
+#   路线 B：填 http://127.0.0.1:15721 串在 CC Switch 前面（注意 CC Switch 切换会改写 settings.json）
+$UpstreamBaseUrl = "https://your-relay.example.com"
+
+# 可选：让代理覆写转发请求的密钥；串 CC Switch（路线 B）时必须留空，由 CC Switch 注入
+# $ApiKey = "sk-xxx"
+
+# 可选：启用调试日志，写入 scripts\proxy.log（结构化 JSON 行，不含请求体与鉴权头）
+$Debug = $true
