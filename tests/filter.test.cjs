@@ -8,6 +8,8 @@ const {
   filterResponsesPayload,
   filterAnthropicPayload,
   classifyCompatibilityError,
+  isTokenRateLimitError,
+  isTerminalLimitError,
 } = require("../filter-core.cjs");
 
 test("只允许用户指定的两个 HTTPS 域名，不能按 URL 子串误匹配", () => {
@@ -148,4 +150,36 @@ test("纯 thinking 消息保留并告警，不虚报已删除的块", () => {
   assert.equal(result.payload, payload);
   assert.equal(result.stats.warnings, 1);
   assert.equal(result.stats.removedThinkingBlocks, 0);
+});
+
+test("Token 限流措辞：只认 token×rate×limit 组合，泛化限流不命中", () => {
+  for (const message of [
+    "Token rate limit reached",
+    "token rate limit exceeded, retry later",
+    "Tokens  rate   limit",
+    "tokens_rate_limit",
+    "TOKEN RATE LIMIT",
+  ]) assert.equal(isTokenRateLimitError(message), true, message);
+  for (const message of [
+    "rate limit exceeded", "Too many requests", "Request limit reached",
+    "concurrent request limit", "", undefined, null, 42, {token: "rate limit"},
+  ]) assert.equal(isTokenRateLimitError(message), false, String(message));
+});
+
+test("终态账号限制：鉴权/配额/余额类措辞命中，且优先于限流判定", () => {
+  for (const message of [
+    "401 Unauthorized", "403 forbidden", "authentication failed",
+    "authorization header invalid", "invalid api key",
+    "insufficient_quota", "quota exceeded", "billing hard limit",
+    "Available balance: 0.00", "out of budget", "usage_limit_exceeded",
+    "monthly usage limit reached", "GoUsageLimitError", "FreeUsageLimitError",
+  ]) assert.equal(isTerminalLimitError(message), true, message);
+  for (const message of [
+    "Token rate limit reached", "429 too many requests", "timeout", "",
+    undefined, null,
+  ]) assert.equal(isTerminalLimitError(message), false, String(message));
+  // 终态与限流措辞并存时两者各自命中（调用方需先检查终态）。
+  const mixed = "Token rate limit reached: available balance insufficient";
+  assert.equal(isTokenRateLimitError(mixed), true);
+  assert.equal(isTerminalLimitError(mixed), true);
 });

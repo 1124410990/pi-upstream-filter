@@ -1,13 +1,13 @@
 {
   "name": "pi-upstream-filter",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/1124410990/pi-upstream-filter.git"
   },
-  "description": "Pi 中转端点密文/签名兼容性错误后一次性恢复扩展",
+  "description": "Pi 中转端点密文/签名兼容性错误后一次性恢复扩展，附 Claude Code 本地代理模式",
   "keywords": ["pi-package"],
   "engines": {
     "node": ">=22.19.0"
@@ -21,16 +21,21 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
+  "bin": {
+    "pi-upstream-filter-proxy": "server.cjs"
+  },
   "files": [
     "index.ts",
+    "server.cjs",
     "filter-core.cjs",
     "filter-core.d.cts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test tests/filter.test.cjs tests/reload.test.cjs tests/auto-continue.test.cjs tests/recovery.test.cjs",
+    "proxy": "node server.cjs",
+    "test": "node --test tests/filter.test.cjs tests/reload.test.cjs tests/auto-continue.test.cjs tests/recovery.test.cjs tests/proxy.test.cjs",
     "test:host": "node --test tests/auto-continue-host.test.cjs tests/recovery-host.test.cjs",
-    "check": "node --check filter-core.cjs"
+    "check": "node --check filter-core.cjs && node --check server.cjs"
   }
 }

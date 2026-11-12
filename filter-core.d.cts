@@ -22,6 +22,8 @@ export interface CompatibilityRejection {
 export function classifyCompatibilityError(
   errorMessage: unknown, payload: unknown, status?: number,
 ): CompatibilityRejection | undefined;
+export function isTokenRateLimitError(message: unknown): boolean;
+export function isTerminalLimitError(message: unknown): boolean;
 export function filterResponsesPayload(
   payload: unknown, options?: Pick<CompatibilityRejection, "reasoning" | "itemIds" | "itemIndex">,
 ): FilterResult;

@@ -100,6 +100,20 @@ function classifyCompatibilityError(errorMessage, payload, status) {
   return undefined;
 }
 
+const TOKEN_RATE_LIMIT = /\btoken(?:s)?[\s_-]+rate[\s_-]+limit\b/i;
+// 持久性账号限制不能靠“继续”恢复，即使错误正文同时提及 Token 限流。
+const TERMINAL_LIMIT_ERROR = /\b(?:401|403)\b|authentication|authorization|invalid api key|insufficient_quota|quota exceeded|billing|available balance|out of budget|usage_limit_exceeded|(?:monthly|daily|weekly) usage limit|GoUsageLimitError|FreeUsageLimitError/i;
+
+/** Token 限流措辞判定（Pi 自动继续与 Claude Code 代理限流重试共用）。 */
+function isTokenRateLimitError(message) {
+  return typeof message === "string" && TOKEN_RATE_LIMIT.test(message);
+}
+
+/** 终态账号限制措辞（鉴权/配额/余额类），重试或“继续”都无法恢复。 */
+function isTerminalLimitError(message) {
+  return typeof message === "string" && TERMINAL_LIMIT_ERROR.test(message);
+}
+
 /**
  * 仅在错误恢复时清理 Responses 历史状态，不修改 include/store/本轮 reasoning。
  * 密文错误只移除 reasoning；跨资源错误同时清理已知记录的 id；格式错误只清理点名项。
@@ -182,6 +196,8 @@ module.exports = {
   looksLikeResponsesPayload,
   looksLikeAnthropicPayload,
   classifyCompatibilityError,
+  isTokenRateLimitError,
+  isTerminalLimitError,
   filterResponsesPayload,
   filterAnthropicPayload,
 };

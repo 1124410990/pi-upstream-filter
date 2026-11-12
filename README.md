@@ -1,10 +1,16 @@
 # pi-upstream-filter
 
-用于 Pi 的进程内兼容性错误恢复扩展，借鉴 CC Switch 的“报错后整流重试”思路。无需监听端口、后台进程或额外运行时依赖。
+用于 Pi 的进程内兼容性错误恢复扩展，借鉴 CC Switch 的“报错后整流重试”思路。v0.4.0 起附带 **Claude Code 本地代理模式**（`server.cjs`），同一份核心逻辑服务两种宿主。
+
+Pi 扩展模式无需监听端口、后台进程或额外运行时依赖；Claude Code 代理模式需要运行一个本地后台进程——这是 Claude Code 架构下唯一可行的挂载点（详见下文「Claude Code 模式」）。
 
 > 这是兼容性规避方案，不是密文解密工具，也不保证解决全部 Azure OpenAI 400 错误。删除历史内部推理状态可能影响复杂任务的连续表现。
 
-## v0.3.0（源码版本，尚未创建发布标签）
+## v0.4.0
+
+新增 Claude Code 本地代理模式（`server.cjs`，`npm run proxy`）：兼容性错误清理重试 + 429 限流退避重放，与 Pi 扩展共用 `filter-core.cjs` 纯函数。限流判定正则下沉到核心模块供两种模式共用，Pi 模式行为不变。详见下文「Claude Code 模式」。
+
+## v0.3.0
 
 从“每次请求主动剥离”改为“正常请求原样发送，明确兼容性错误后清理重试一次”。
 
@@ -14,7 +20,7 @@
 - `/filter` 区分原样放行、兼容性错误、清理尝试及恢复结果。
 - Token 限流自动继续的五次预算规则保持不变。
 
-`package.json` 已设为 0.3.0，当前分支源码包含新行为，尚未创建对应 Git 发布标签。下面的 v0.2.1 标签安装仍是旧行为，试用新行为请获取当前分支源码后本地加载。
+v0.3.0 未单独创建发布标签，其行为已随 v0.4.0 标签一并发布；下文的 v0.2.1 标签安装仍是旧的始终过滤行为。
 
 ## v0.2.1
 
@@ -82,6 +88,70 @@
 
 使用 Pi 1.4.0 的 `agent_before_settle` / `agent_settled` 事件及 `sendUserMessage` API；其他版本尚未验证。
 
+## Claude Code 模式（v0.4.0 新增）
+
+Claude Code 没有进程内扩展 API，唯一挂载点是 `ANTHROPIC_BASE_URL` 指向本地代理（CC Switch / claude-code-router 同款架构）。`server.cjs` 是零运行时依赖的本地代理，与 Pi 扩展共用同一份 `filter-core.cjs` 纯函数，单一事实来源：
+
+```
+Claude Code ──ANTHROPIC_BASE_URL──▶ server.cjs (127.0.0.1:8788) ──▶ UPSTREAM_BASE_URL（中转站 / CC Switch）
+                                        └─ require("./filter-core.cjs") ← Pi 扩展 index.ts 继续共用
+```
+
+两种模式进程独立、互不干扰，可以同时运行。`FILTER_HOSTS` 域名白名单门控仅 Pi 模式生效；代理按请求体形态（anthropic-messages 结构）判定，与目标域名无关。
+
+### 启动
+
+```powershell
+$env:UPSTREAM_BASE_URL = "https://agentrouter.org"
+npm run proxy
+```
+
+启动后输出 `代理已启动：http://127.0.0.1:8788 → https://agentrouter.org`；`GET http://127.0.0.1:8788/healthz` 返回版本与统计 JSON，可用于确认存活。
+
+然后配置 `%USERPROFILE%\.claude\settings.json`（注意不带 `/v1` 尾缀）：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8788",
+    "ANTHROPIC_AUTH_TOKEN": "sk-xxx"
+  }
+}
+```
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `UPSTREAM_BASE_URL` | **必填** | 上游 origin，不含 `/v1`；允许 http(s)（供本地 CC Switch 链路） |
+| `HOST` / `PORT` | `127.0.0.1` / `8788` | 默认只绑定本机回环，避免防火墙弹窗；设 `0.0.0.0` 会打印明文密钥警告 |
+| `UPSTREAM_API_KEY` | 无 | 设定时覆写转发请求的 `authorization` / `x-api-key` |
+| `FILTER_DEBUG` / `FILTER_LOG_FILE` | 关 / 无 | 结构化 JSON 行日志（不含请求体与鉴权头），分别输出到 stderr / 文件 |
+| `MAX_BODY_MB` | `64` | 请求体缓冲上限，超限回 413 |
+| `RATE_LIMIT_MAX_RETRIES` | `5` | 每请求限流重放预算，与 Pi 五次对齐，按请求自然重置 |
+| `RATE_BACKOFF_BASE_MS` / `RATE_BACKOFF_MAX_MS` | `1000` / `30000` | 指数退避区间；`retry-after` 优先且封顶 60s，指数路径含 ±25% 抖动 |
+
+### 两种上游拓扑
+
+- **A 直连中转站**：`UPSTREAM_BASE_URL=https://agentrouter.org`。密钥经 `UPSTREAM_API_KEY` 设定，或由客户端 `ANTHROPIC_AUTH_TOKEN` 透传。
+- **B 串 CC Switch**：`UPSTREAM_BASE_URL=http://127.0.0.1:15721`（CC Switch 的监听端口），**不设** `UPSTREAM_API_KEY`，由 CC Switch 注入密钥。这恰好补上 Pi 模式「`baseUrl` 指向 localhost CC Switch 时无法识别」的能力缺口。
+
+### 行为
+
+- **正常请求字节级透传**：不改写请求体，SSE 以流式管道渐进转发（不整体缓冲）；gzip 请求体透明处理（转发原始字节，仅在需要清理时解压）。
+- **清理重试链**：上游返回白名单兼容性错误（thinking 签名 / 加密 reasoning 校验失败等，与 Pi 模式同一套措辞判定）时，清理历史推理状态并**立即重试一次**；再次失败则原样回传，不再追加。
+- **限流重试链**：429 或 token rate limit 措辞触发带退避的有限次重放（尊重 `retry-after`）；余额 / 配额 / 鉴权等终态措辞不重试。两条链互不相交，同一错误不会重复消耗。
+- 其余错误（401/403、5xx 等）原样透传，由 Claude Code 自带的重试机制处理。
+- 每个响应追加 `x-upstream-filter` 调试头：`pass` / `cleaned` / `cleaned-failed` / `rate-retried` / `rate-exhausted` / `error`。
+- 只在尚未向客户端写出任何字节前判定重试；**HTTP 200 SSE 流内的错误事件 v1 一律透传不处理**（与 Pi 宿主能力的真实差异）。
+- `Ctrl+C` / 终止信号触发优雅关闭：停止接受新连接，给在途请求 10 秒排空窗口，输出统计摘要。
+
+### 注意事项
+
+- Claude Code v2.1.196 起，`ANTHROPIC_BASE_URL` 指向非 `api.anthropic.com` 时会禁用 Remote Control，属预期行为，不影响本地使用。
+- 清理后的请求以明文 JSON 重发（不重新压缩），有少量带宽代价。
+- 代理默认只监听本机回环；不要暴露到不可信网络，鉴权头会以明文经过代理进程。
+
 ## 安装
 
 本地试用：
@@ -92,10 +162,10 @@ pi --no-extensions --extension ./index.ts
 
 `--no-extensions` 用于避免本机已安装副本与试用副本重复注册 `/filter`，仅对本次运行有效。
 
-GitHub 已发布标签版本安装（`v0.2.1`，仍是始终过滤行为，不含当前源码的 0.3.0 改动）：
+GitHub 标签版本安装（`v0.4.0`，与当前源码一致）：
 
 ```text
-pi install git:github.com/1124410990/pi-upstream-filter@v0.2.1
+pi install git:github.com/1124410990/pi-upstream-filter@v0.4.0
 ```
 
 在当前 Pi 窗口执行：
@@ -107,11 +177,11 @@ pi install git:github.com/1124410990/pi-upstream-filter@v0.2.1
 
 当前源码首次无配置时默认开启 Responses 和 Anthropic **错误后恢复**，`on` 不再表示每次剥离；已有配置中的开关保持不变。若已有手工安装副本，请先通过 `pi config` 禁用它，再安装包，避免重复命令和重复过滤。
 
-Git 标签安装是固定版本，`/reload` 不会升级旧标签。下面仅是旧发布版本之间的升级示例，**不会获得当前源码的 0.3.0 行为**：
+Git 标签安装是固定版本，`/reload` 不会升级旧标签。从旧标签升级的示例（v0.2.1 的始终过滤行为由此切换为错误后恢复）：
 
 ```text
-pi remove git:github.com/1124410990/pi-upstream-filter@v0.2.0
-pi install git:github.com/1124410990/pi-upstream-filter@v0.2.1
+pi remove git:github.com/1124410990/pi-upstream-filter@v0.2.1
+pi install git:github.com/1124410990/pi-upstream-filter@v0.4.0
 ```
 
 然后回到 Pi 窗口执行 `/reload`。本地路径安装只需更新对应源码后 `/reload`。
@@ -135,7 +205,7 @@ pi install git:github.com/1124410990/pi-upstream-filter@v0.2.1
 卸载 GitHub 包时使用与安装相同的 source：
 
 ```text
-pi remove git:github.com/1124410990/pi-upstream-filter@v0.2.1
+pi remove git:github.com/1124410990/pi-upstream-filter@v0.4.0
 ```
 
 然后 `/reload`。个人开关和诊断日志不属于包源码，可自行保留。
@@ -161,7 +231,7 @@ npm run test:host
 npm run check
 ```
 
-普通测试共 39 项（包含子测试），覆盖核心分类/清理、热重载、错误恢复状态机及原有自动继续预算。`test:host` 共 22 项（包含子测试）：新恢复套件运行真实 Pi 会话、provider、SDK 序列化与钩子链，只替换 `fetch` 返回离线 HTTP/SSE；验证正常请求保留密文、400/SSE 后一次恢复、工具配对、原历史不变、失败上限、无关原生重试及竞争取消。原自动继续套件替换模型输出且阻止联网，验证 24 次上限和恢复取消。该命令必须设置 `PI_TEST_PACKAGE_DIR`，缺失直接报错，不静默跳过。
+普通测试共 59 项（包含子测试），覆盖核心分类/清理与限流措辞判定、热重载、错误恢复状态机、原有自动继续预算，以及 Claude Code 代理的离线全链路（透传、清理重试、限流重放、中断与边界）。`test:host` 共 22 项（包含子测试）：新恢复套件运行真实 Pi 会话、provider、SDK 序列化与钩子链，只替换 `fetch` 返回离线 HTTP/SSE；验证正常请求保留密文、400/SSE 后一次恢复、工具配对、原历史不变、失败上限、无关原生重试及竞争取消。原自动继续套件替换模型输出且阻止联网，验证 24 次上限和恢复取消。该命令必须设置 `PI_TEST_PACKAGE_DIR`，缺失直接报错，不静默跳过。
 
 已验证的测试不调用实际供应商、不读取真实凭据。实际收费供应商多轮会话、真实压缩链路、WebSocket 和完整 Pi UI 尚未验证。
 

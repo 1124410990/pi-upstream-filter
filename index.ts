@@ -117,9 +117,6 @@ interface Totals {
 
 const DEFAULT_CONFIG: FilterConfig = { responses: true, anthropic: true };
 const MAX_AUTO_CONTINUES = 5;
-const TOKEN_RATE_LIMIT = /\btoken(?:s)?[\s_-]+rate[\s_-]+limit\b/i;
-// 持久性账号限制不能靠“继续”恢复，即使错误正文同时提及 Token 限流。
-const TERMINAL_LIMIT_ERROR = /\b(?:401|403)\b|authentication|authorization|invalid api key|insufficient_quota|quota exceeded|billing|available balance|out of budget|usage_limit_exceeded|(?:monthly|daily|weekly) usage limit|GoUsageLimitError|FreeUsageLimitError/i;
 
 function agentDir(): string {
   const home = process.env.USERPROFILE || process.env.HOME || "";
@@ -201,6 +198,8 @@ export default async function (pi: ExtensionApiLike) {
     looksLikeAnthropicPayload,
     looksLikeResponsesPayload,
     classifyCompatibilityError,
+    isTokenRateLimitError,
+    isTerminalLimitError,
   } = require(corePath) as typeof import("./filter-core.cjs");
   const fs = await import("node:fs");
   const config = await loadConfig();
@@ -369,7 +368,7 @@ export default async function (pi: ExtensionApiLike) {
     // 此边界位于宿主重试、压缩和排队工作之后；不在每次 agent_end 时抢先续跑。
     if (event.outcome !== "error" || event.continue || event.context.pendingMessages.length > 0 ||
         ctx.hasPendingMessages() || ctx.signal?.aborted || lastAssistant?.stopReason !== "error" ||
-        !TOKEN_RATE_LIMIT.test(errorMessage) || TERMINAL_LIMIT_ERROR.test(errorMessage)) return;
+        !isTokenRateLimitError(errorMessage) || isTerminalLimitError(errorMessage)) return;
     if (autoContinues >= MAX_AUTO_CONTINUES) {
       ctx.ui.notify(`自动继续 ${MAX_AUTO_CONTINUES} 次已耗尽，请手动处理限流。`, "warning");
       return;
