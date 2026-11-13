@@ -150,12 +150,26 @@ npm run proxy
 - **A 直连中转站**：`UPSTREAM_BASE_URL=https://agentrouter.org`。密钥经 `UPSTREAM_API_KEY` 设定，或由客户端 `ANTHROPIC_AUTH_TOKEN` 透传。
 - **B 串 CC Switch**：`UPSTREAM_BASE_URL=http://127.0.0.1:15721`（CC Switch 的监听端口），**不设** `UPSTREAM_API_KEY`，由 CC Switch 注入密钥。这恰好补上 Pi 模式「`baseUrl` 指向 localhost CC Switch 时无法识别」的能力缺口。
 
+串 CC Switch 时，请确认实际链路是 **Claude Code → 8788（本代理）→ 15721（CC Switch）→ 模型上游**。只双击启动代理，不会自动改变 Claude Code 的入口；若 Claude Code 仍直连 15721，本代理不会接到请求，也无法恢复 422。不要将 CC Switch 的同一路由反向指到 8788，以免循环。
+
+不改全局配置的 PowerShell 启动方式（仅覆盖此次启动的入口，原认证及其他设置继续继承）：
+
+```powershell
+$proxySettings = Join-Path $env:TEMP ("pi-upstream-filter-" + [guid]::NewGuid() + ".json")
+'{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8788"}}' | Set-Content -LiteralPath $proxySettings -Encoding ASCII
+claude --settings $proxySettings
+# 要恢复原会话，改用：claude --resume --settings $proxySettings
+```
+
+修改代理源码后，需要先双击 `scripts/stop-proxy.vbs`，再双击 `scripts/start-proxy.vbs`；正在运行的代理不会自动加载新代码。Claude Code 入口设置也需在新启动或恢复会话时应用。
+
 ### 行为
 
 - **正常请求字节级透传**：不改写请求体，SSE 以流式管道渐进转发（不整体缓冲）；gzip 请求体透明处理（转发原始字节，仅在需要清理时解压）。
-- **清理重试链**：上游返回白名单兼容性错误（thinking 签名 / 加密 reasoning 校验失败等，与 Pi 模式同一套措辞判定）时，清理历史推理状态并**立即重试一次**；再次失败则原样回传，不再追加。
-- **限流重试链**：429 或 token rate limit 措辞触发带退避的有限次重放（尊重 `retry-after`）；余额 / 配额 / 鉴权等终态措辞不重试。两条链互不相交，同一错误不会重复消耗。
-- 其余错误（401/403、5xx 等）原样透传，由 Claude Code 自带的重试机制处理。
+- **清理重试链**：没有终态或明确限流信号时，上游的白名单兼容性错误（thinking 签名 / 加密 reasoning 校验失败等，与 Pi 模式同一套措辞判定）触发历史推理状态清理并**立即重试一次**；不追加第二次清理，后续限流仍可按独立链处理。
+- **限流重试链**：429、明确的 `token rate limit` / `too_many_requests` / `too many requests` 错误文本，或指定错误字段中的 `too_many_requests` / `rate_limit_error` 代码，触发带退避的有限次重放（尊重 `retry-after`），包括 CC Switch 包装成 **422** 的明确限流错误。**明确限流优先于 thinking 清理，只重放当前请求字节（包括 gzip）**。401/403 状态、余额 / 配额 / 鉴权 / 明确权限拒绝等终态文本和代码优先排除；终态检查涵盖全部指定文本，不被主文本优先级遮蔽。**Claude Code 侧重放原 HTTP 请求，不在聊天中发送“继续”**；Pi 的自动“继续”匹配范围不变。
+- **错误判定边界**：文本仅读取 `error.message`、字符串 `error`、顶层 `message`；代码仅读取 `error.code` / `error.type` 和顶层 `code` / `type`，每字段最多 4096 字符，不扫描 JSON 数组、`details` 或引用请求。错误体缓冲仍限 256 KiB；已知 / 形似 JSON 或截断响应解析失败时不降级扫描原文，完整非 JSON 纯文本包装错误仍可识别。
+- 普通 422、仅有 `high demand` / `peak load` 的错误，以及其余未命中上述规则的错误原样透传，由 Claude Code 自带的重试机制处理。
 - 每个响应追加 `x-upstream-filter` 调试头：`pass` / `cleaned` / `cleaned-failed` / `rate-retried` / `rate-exhausted` / `error`。
 - 只在尚未向客户端写出任何字节前判定重试；**HTTP 200 SSE 流内的错误事件 v1 一律透传不处理**（与 Pi 宿主能力的真实差异）。
 - `Ctrl+C` / 终止信号触发优雅关闭：停止接受新连接，给在途请求 10 秒排空窗口，输出统计摘要。
@@ -245,7 +259,7 @@ npm run test:host
 npm run check
 ```
 
-普通测试共 59 项（包含子测试），覆盖核心分类/清理与限流措辞判定、热重载、错误恢复状态机、原有自动继续预算，以及 Claude Code 代理的离线全链路（透传、清理重试、限流重放、中断与边界）。`test:host` 共 22 项（包含子测试）：新恢复套件运行真实 Pi 会话、provider、SDK 序列化与钩子链，只替换 `fetch` 返回离线 HTTP/SSE；验证正常请求保留密文、400/SSE 后一次恢复、工具配对、原历史不变、失败上限、无关原生重试及竞争取消。原自动继续套件替换模型输出且阻止联网，验证 84 次上限和恢复取消。该命令必须设置 `PI_TEST_PACKAGE_DIR`，缺失直接报错，不静默跳过。
+普通测试共 73 项（包含子测试），覆盖核心分类/清理与限流措辞判定、热重载、错误恢复状态机、原有自动继续预算，以及 Claude Code 代理的离线全链路（透传、清理重试、429/422 限流重放、终态错误优先、中断与边界）。`test:host` 共 22 项（包含子测试）：新恢复套件运行真实 Pi 会话、provider、SDK 序列化与钩子链，只替换 `fetch` 返回离线 HTTP/SSE；验证正常请求保留密文、400/SSE 后一次恢复、工具配对、原历史不变、失败上限、无关原生重试及竞争取消。原自动继续套件替换模型输出且阻止联网，验证 84 次上限和恢复取消。该命令必须设置 `PI_TEST_PACKAGE_DIR`，缺失直接报错，不静默跳过。
 
 已验证的测试不调用实际供应商、不读取真实凭据。实际收费供应商多轮会话、真实压缩链路、WebSocket 和完整 Pi UI 尚未验证。
 

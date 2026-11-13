@@ -210,6 +210,39 @@ function extractErrorMessage(bodyBuffer) {
   return text.trim().slice(0, 4096);
 }
 
+/**
+ * 代理限流专用信号：仅取 error.message/error/message 和 error.code/type、顶层 code/type。
+ * 每字段最多 4096 字符；保留主文本优先级，额外指定文本用于终态排除。
+ * 已知/形似 JSON 或截断响应解析失败时不扫描原文，完整非 JSON 文本才可兜底。
+ * 与 extractErrorMessage 分开，保留兼容性清理的原始 JSON 兜底语义。
+ */
+function extractErrorMetadata(bodyBuffer, { truncated = false, contentType = "" } = {}) {
+  let text;
+  try {
+    text = Buffer.isBuffer(bodyBuffer) ? bodyBuffer.toString("utf8") : String(bodyBuffer || "");
+  } catch {
+    return { message: "", messages: [], codes: [] };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    const jsonResponse = /^(?:application|text)\/(?:[\w.+-]+\+)?json(?:\s*;|$)/i.test(contentType);
+    if (truncated || jsonResponse || /^\s*[\[{]/.test(text)) return { message: "", messages: [], codes: [] };
+    const message = text.trim().slice(0, 4096);
+    return { message, messages: [message], codes: [] };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { message: "", messages: [], codes: [] };
+  const error = parsed.error && typeof parsed.error === "object" && !Array.isArray(parsed.error) ? parsed.error : {};
+  const messages = [error.message, parsed.error, parsed.message]
+    .filter((value) => typeof value === "string")
+    .map((value) => value.slice(0, 4096));
+  const codes = [error.code, error.type, parsed.code, parsed.type]
+    .filter((value) => typeof value === "string")
+    .map((value) => value.trim().slice(0, 4096));
+  return { message: messages[0] || "", messages, codes };
+}
+
 /** 构建上游请求头：剔除 hop-by-hop，accept-encoding 固定 identity（保证 SSE 字节级透传）。 */
 function buildUpstreamHeaders(clientHeaders, config, { bodyReplaced = false, newLength = 0 } = {}) {
   const out = {};
@@ -254,12 +287,28 @@ function computeBackoffMs(attempt, retryAfterHeader, config) {
   return Math.round(Math.min(Math.max(jitter, config.backoffBaseMs), config.backoffMaxMs));
 }
 
+// 仅扩展代理层；Pi 自动“继续”仍只使用共享 token rate limit 判定。
+const TOO_MANY_REQUESTS = /\btoo[\s_]+many[\s_]+requests\b/i;
+const RATE_LIMIT_CODE = /^(?:too_many_requests|rate_limit_error)$/i;
+const TERMINAL_ACCESS_CODE = /^(?:unauthorized|forbidden|permission_error|permission_denied|access_denied)$/i;
+const TERMINAL_ACCESS_TEXT = /\b(?:permission|access)[\s_-]+denied\b|^\s*(?:unauthorized|forbidden)\s*(?:[.:]|$)/i;
+
+/** HTTP 鉴权状态、所有指定文本中的账号/权限终态及代码优先，不能靠重放恢复。 */
+function isTerminalRateLimit(status, message, codes = [], messages = []) {
+  return status === 401 || status === 403
+    || [message, ...messages].some((text) => isTerminalLimitError(text) || TERMINAL_ACCESS_TEXT.test(text))
+    || codes.some((code) => isTerminalLimitError(code)
+      || isTerminalLimitError(code.replace(/[_-]+/g, " ")) || TERMINAL_ACCESS_CODE.test(code));
+}
+
 /**
- * 限流判定：状态码 429 为主，文本兜底（对齐 Pi 仅凭错误文本也能触发）；
- * 终态措辞（鉴权/配额/余额）命中则不重试——重试无法恢复账号级限制。
+ * 限流判定：429、明确 token rate limit/too_many_requests 文本或白名单错误代码。
+ * 不以 422、high demand 或 peak load 本身为依据；终态信号始终优先。
  */
-function isRateLimited(status, message) {
-  return (status === 429 || isTokenRateLimitError(message)) && !isTerminalLimitError(message);
+function isRateLimited(status, message, codes = [], messages = []) {
+  return !isTerminalRateLimit(status, message, codes, messages)
+    && (status === 429 || isTokenRateLimitError(message) || TOO_MANY_REQUESTS.test(message)
+      || codes.some((code) => RATE_LIMIT_CODE.test(code)));
 }
 
 /** 剔除 hop-by-hop 头，其余原样保留（字节级透传，content-length/encoding 有效）。 */
@@ -498,9 +547,14 @@ async function handleClient(config, clientReq, clientRes, stats, log) {
     const { buffer: errorBuffer, truncated } = await readAll(upstreamRes, MAX_ERROR_BODY_BYTES);
     if (signal.aborted) return;
     const message = extractErrorMessage(errorBuffer);
+    const rateError = extractErrorMetadata(errorBuffer, {
+      truncated, contentType: upstreamRes.headers["content-type"],
+    });
+    const terminal = isTerminalRateLimit(status, rateError.message, rateError.codes, rateError.messages);
+    const rateLimited = isRateLimited(status, rateError.message, rateError.codes, rateError.messages);
 
-    // ① 清理链（优先，至多一次）：白名单兼容性错误 → 清历史 thinking → 立即重试。
-    if (!cleanupEvaluated && payload) {
+    // ① 仅无终态/限流信号时，清理白名单兼容性错误（至多一次）。
+    if (!terminal && !rateLimited && !cleanupEvaluated && payload) {
       const rejection = classifyCompatibilityError(message, payload, status);
       if (rejection) {
         cleanupEvaluated = true;
@@ -520,8 +574,8 @@ async function handleClient(config, clientReq, clientRes, stats, log) {
       }
     }
 
-    // ② 限流链（独立预算）：带退避重放同一字节；终态措辞已由 isRateLimited 排除。
-    if (isRateLimited(status, message)) {
+    // ② 已分类限流：独立预算，带退避重放当前字节，不进入 thinking 清理。
+    if (rateLimited) {
       if (rateRetries < config.maxRateRetries) {
         const delay = computeBackoffMs(rateRetries, upstreamRes.headers["retry-after"], config);
         try {
@@ -540,7 +594,7 @@ async function handleClient(config, clientReq, clientRes, stats, log) {
       return;
     }
 
-    if (isTerminalLimitError(message)) stats.terminalRateLimits++;
+    if (terminal) stats.terminalRateLimits++;
     const action = cleaned ? "cleaned-failed" : "pass";
     if (cleaned) stats.cleanupFailures++;
     log("relay", { path: pathOnly, status, action, rateRetries });
@@ -606,6 +660,7 @@ module.exports = {
   readRequestBody,
   parseJsonBody,
   extractErrorMessage,
+  extractErrorMetadata,
   buildUpstreamHeaders,
   computeBackoffMs,
   parseRetryAfterMs,

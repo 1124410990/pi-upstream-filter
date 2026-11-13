@@ -132,6 +132,15 @@ const RATE_LIMIT_ERROR = JSON.stringify({
   error: { type: "rate_limit_error", message: "Rate limit exceeded, please retry" },
 });
 
+const WRAPPED_RATE_LIMIT_MESSAGE = "格式转换错误: Responses upstream too_many_requests: "
+  + "The system is currently experiencing high demand and cannot process your request. "
+  + "Your request exceeds the maximum usage size allowed during peak load. "
+  + "For improved capacity reliability, consider switching to Provisioned Throughput.";
+const WRAPPED_RATE_LIMIT_ERROR = JSON.stringify({
+  type: "error",
+  error: { type: "invalid_request_error", message: WRAPPED_RATE_LIMIT_MESSAGE },
+});
+
 test("parseConfig：缺参/非法 URL 中文报错，尾斜杠剥离，默认值齐全", () => {
   assert.throws(() => proxy.parseConfig({}), /UPSTREAM_BASE_URL/);
   assert.throws(() => proxy.parseConfig({ UPSTREAM_BASE_URL: "not a url" }), /合法 URL/);
@@ -230,6 +239,100 @@ test("extractErrorMessage / isRateLimited：JSON 优先、截断、终态优先"
   assert.equal(proxy.isRateLimited(500, "server exploded"), false);
   assert.equal(proxy.isRateLimited(429, "insufficient available balance"), false); // 终态优先
   assert.equal(proxy.isRateLimited(429, "Token rate limit: 401 authentication required"), false);
+});
+
+test("代理限流分类：包装文本与结构化代码命中，HTTP 鉴权及终态代码优先", () => {
+  assert.equal(proxy.isRateLimited(422, WRAPPED_RATE_LIMIT_MESSAGE), true);
+  assert.equal(proxy.isRateLimited(422, "Responses upstream TOO MANY REQUESTS: please retry"), true);
+  assert.equal(proxy.isRateLimited(422, "high demand during peak load"), false);
+  assert.equal(proxy.isRateLimited(422, "not_too_many_requests / too_many_requests_extra"), false);
+  assert.equal(proxy.isRateLimited(422, "busy", ["too_many_requests"]), true);
+  assert.equal(proxy.isRateLimited(422, "busy", ["rate_limit_error"]), true);
+  assert.equal(proxy.isRateLimited(401, WRAPPED_RATE_LIMIT_MESSAGE), false);
+  assert.equal(proxy.isRateLimited(403, "Token rate limit reached"), false);
+  for (const message of ["permission denied", "ACCESS DENIED", "Unauthorized", "Forbidden"]) {
+    assert.equal(proxy.isRateLimited(422, message, ["rate_limit_error"]), false, message);
+  }
+  assert.equal(proxy.isRateLimited(422, "Permission checks queued; please retry", ["too_many_requests"]), true);
+  assert.equal(proxy.isRateLimited(422, "Forbidden characters in the submitted business text", ["too_many_requests"]), true);
+  assert.equal(proxy.isRateLimited(422, "Forbidden: request not authorized", ["too_many_requests"]), false);
+  assert.equal(proxy.isRateLimited(429, "busy", [], ["permission denied"]), false);
+  assert.equal(proxy.isRateLimited(422, "busy", ["too_many_requests"], ["Available balance is not enough"]), false);
+  for (const code of ["insufficient_quota", "quota_exceeded", "invalid_api_key", "permission_error",
+    "permission_denied", "billing_error", "usage_limit_exceeded", "out_of_budget"]) {
+    assert.equal(proxy.isRateLimited(422, WRAPPED_RATE_LIMIT_MESSAGE, [code]), false, code);
+    assert.equal(proxy.isRateLimited(429, "busy", ["too_many_requests", code]), false, code);
+  }
+});
+
+test("extractErrorMetadata：只读取指定错误字段，不以完整 JSON 或 details 为错误文本", () => {
+  const input = JSON.stringify({
+    code: "too_many_requests", type: "error",
+    error: { code: "insufficient_quota", type: "rate_limit_error", message: "busy" },
+    message: "Available balance is not enough",
+    details: { code: "invalid_api_key", message: "too many requests" },
+    request: { error: { message: "permission denied" } },
+  });
+  assert.deepEqual(proxy.extractErrorMetadata(Buffer.from(input)), {
+    message: "busy", messages: ["busy", "Available balance is not enough"],
+    codes: ["insufficient_quota", "rate_limit_error", "too_many_requests", "error"],
+  });
+  assert.deepEqual(proxy.extractErrorMetadata(Buffer.from(JSON.stringify({
+    error: { code: "too_many_requests" }, details: { message: "billing" },
+  }))), { message: "", messages: [], codes: ["too_many_requests"] });
+  assert.deepEqual(proxy.extractErrorMetadata(Buffer.from(JSON.stringify({
+    details: { code: "too_many_requests" }, request: { message: "token rate limit" },
+  }))), { message: "", messages: [], codes: [] });
+  assert.deepEqual(proxy.extractErrorMetadata(Buffer.from(JSON.stringify({
+    error: "busy", message: "permission denied", code: { value: "too_many_requests" }, type: ["rate_limit_error"],
+  }))), { message: "busy", messages: ["busy", "permission denied"], codes: [] });
+  for (const value of [[{ error: { message: "too many requests" } }], "too_many_requests", null]) {
+    assert.deepEqual(proxy.extractErrorMetadata(Buffer.from(JSON.stringify(value))), { message: "", messages: [], codes: [] });
+  }
+  assert.deepEqual(proxy.extractErrorMetadata(Buffer.from("  too many requests  ")),
+    { message: "too many requests", messages: ["too many requests"], codes: [] });
+  // 既有导出继续保留原始 JSON 兜底，不改变兼容性错误提取行为。
+  const noMessage = JSON.stringify({ details: { code: "too_many_requests" } });
+  assert.equal(proxy.extractErrorMessage(Buffer.from(noMessage)), noMessage);
+});
+
+test("extractErrorMetadata：主文本优先级不变，每个指定文本与代码分别有界", () => {
+  const fields = ["a", "b", "c", "d", "e", "f"].map((letter) => letter.repeat(10000));
+  const metadata = proxy.extractErrorMetadata(Buffer.from(JSON.stringify({
+    error: { message: fields[0], code: fields[2], type: fields[3] },
+    message: fields[1], code: fields[4], type: fields[5],
+    details: { message: "permission denied" },
+  })));
+  assert.equal(metadata.message, fields[0].slice(0, 4096));
+  assert.deepEqual(metadata.messages, fields.slice(0, 2).map((text) => text.slice(0, 4096)));
+  assert.deepEqual(metadata.codes, fields.slice(2).map((text) => text.slice(0, 4096)));
+  const stringError = proxy.extractErrorMetadata(Buffer.from(JSON.stringify({ error: fields[0], message: fields[1] })));
+  assert.deepEqual(stringError, { message: fields[0].slice(0, 4096), messages: metadata.messages, codes: [] });
+  const emptyPrimary = proxy.extractErrorMetadata(Buffer.from(JSON.stringify({ error: { message: "" }, message: "billing" })));
+  assert.deepEqual(emptyPrimary, { message: "", messages: ["", "billing"], codes: [] });
+  assert.equal(proxy.isRateLimited(429, emptyPrimary.message, emptyPrimary.codes, emptyPrimary.messages), false);
+  const outOfBoundsTerminal = proxy.extractErrorMetadata(Buffer.from(JSON.stringify({
+    error: { message: "busy", code: "too_many_requests" }, message: "x".repeat(4096) + " available balance",
+  })));
+  assert.equal(proxy.isRateLimited(422, outOfBoundsTerminal.message, outOfBoundsTerminal.codes, outOfBoundsTerminal.messages), true);
+  const raw = proxy.extractErrorMetadata(Buffer.from("x".repeat(10000)));
+  assert.equal(raw.message.length, 4096);
+  assert.deepEqual(raw.messages, [raw.message]);
+});
+
+test("extractErrorMetadata：已知 JSON 或截断时解析失败不扫描，完整纯文本继续识别", () => {
+  const empty = { message: "", messages: [], codes: [] };
+  for (const contentType of ["application/json", "application/problem+json; charset=utf-8", "TEXT/JSON"]) {
+    assert.deepEqual(proxy.extractErrorMetadata(Buffer.from(WRAPPED_RATE_LIMIT_MESSAGE), { contentType }), empty);
+  }
+  const invalidJson = '{"details":{"code":"too_many_requests"},"padding":';
+  assert.deepEqual(proxy.extractErrorMetadata(Buffer.from(invalidJson), { contentType: "text/plain" }), empty);
+  assert.deepEqual(proxy.extractErrorMetadata(Buffer.from('[{"code":"too_many_requests"}')), empty);
+  assert.deepEqual(proxy.extractErrorMetadata(Buffer.from(WRAPPED_RATE_LIMIT_MESSAGE), { truncated: true, contentType: "text/plain" }), empty);
+  const text = proxy.extractErrorMetadata(Buffer.from(WRAPPED_RATE_LIMIT_MESSAGE), { contentType: "text/plain" });
+  assert.deepEqual(text, { message: WRAPPED_RATE_LIMIT_MESSAGE, messages: [WRAPPED_RATE_LIMIT_MESSAGE], codes: [] });
+  assert.equal(proxy.isRateLimited(422, text.message, text.codes, text.messages), true);
+  assert.equal(proxy.extractErrorMessage(Buffer.from(invalidJson)), invalidJson);
 });
 
 test("纯透传：POST/GET 字节与头原样、host 改写、查询串保留", async () => {
@@ -440,6 +543,334 @@ test("429 重试成功：同字节重放，响应头标记 rate-retried", async 
     assert.deepEqual(upstream.received[1].body, upstream.received[0].body); // 逐字节相同
     assert.equal(upstream.received[1].headers.authorization, "Bearer tok");
     assert.equal(proxyServer.stats.rateRetries, 1);
+  } finally {
+    await proxyServer.close();
+    await upstream.close();
+  }
+});
+
+test("422 包装限流重试成功：文本、指定 code/type 和 gzip 均原字节重放", async () => {
+  const cases = [
+    { body: WRAPPED_RATE_LIMIT_MESSAGE, contentType: "text/plain" },
+    { body: WRAPPED_RATE_LIMIT_ERROR },
+    { body: JSON.stringify({ error: WRAPPED_RATE_LIMIT_MESSAGE }) },
+    { body: JSON.stringify({ message: "Responses upstream too many requests: busy" }) },
+    { body: JSON.stringify({ error: { code: "too_many_requests", message: "high demand" } }) },
+    { body: JSON.stringify({ error: { type: "too_many_requests" } }) },
+    { body: JSON.stringify({ error: { type: "rate_limit_error", message: "busy" } }) },
+    { body: JSON.stringify({ code: "too_many_requests", message: "busy" }) },
+    { body: JSON.stringify({ type: "too_many_requests" }) },
+    { body: JSON.stringify({ error: { code: "too_many_requests", message: "Permission checks queued; please retry" } }) },
+    { body: JSON.stringify({ error: { code: "too_many_requests", message: "Forbidden characters in the submitted business text" } }) },
+    { body: JSON.stringify({
+      error: { code: "too_many_requests", message: "busy" },
+      details: { message: "permission denied" }, request: { error: { message: "Available balance is not enough" } },
+    }) },
+    { body: WRAPPED_RATE_LIMIT_ERROR, gzip: true },
+  ];
+  for (const item of cases) {
+    const upstream = await startUpstream([
+      { status: 422, headers: { "content-type": item.contentType || "application/json", "retry-after": "0" }, body: item.body },
+      { status: 200, headers: { "content-type": "application/json" }, body: '{"ok":true}' },
+    ]);
+    const proxyServer = await startProxy(upstream.port);
+    try {
+      const plain = Buffer.from(JSON.stringify(anthropicPayload, null, 2));
+      const bytes = item.gzip ? zlib.gzipSync(plain) : plain;
+      const response = await request(proxyServer.port, {
+        headers: { "content-type": "application/json", authorization: "Bearer tok",
+          "content-length": String(bytes.length), ...(item.gzip ? { "content-encoding": "gzip" } : {}) },
+        body: bytes,
+      });
+      assert.equal(response.status, 200, item.body);
+      assert.equal(response.body.toString(), '{"ok":true}');
+      assert.equal(response.headers["x-upstream-filter"], "rate-retried");
+      assert.equal(upstream.received.length, 2);
+      for (const seen of upstream.received) {
+        assert.deepEqual(seen.body, bytes); // 不清 thinking，不插入“继续”，也不重新序列化或压缩
+        assert.equal(seen.headers.authorization, "Bearer tok");
+        assert.equal(seen.headers["content-encoding"], item.gzip ? "gzip" : undefined);
+      }
+      assert.equal(proxyServer.stats.rateRetries, 1);
+      assert.equal(proxyServer.stats.cleanupRetries, 0);
+    } finally {
+      await proxyServer.close();
+      await upstream.close();
+    }
+  }
+});
+
+test("普通 422 和非错误字段不重试，终态措辞、代码与 HTTP 鉴权优先", async () => {
+  const cases = [
+    { body: "invalid request body" },
+    { body: "The system is currently experiencing high demand during peak load." },
+    { body: JSON.stringify({ error: { type: "invalid_request_error", message: "invalid schema" } }) },
+    { body: JSON.stringify({ details: { code: "too_many_requests", message: "too many requests" } }) },
+    { body: JSON.stringify({ request: { error: { code: "too_many_requests" } } }) },
+    { body: JSON.stringify([{ error: { code: "too_many_requests" } }]) },
+    { body: JSON.stringify({ error: { code: { value: "too_many_requests" }, type: ["rate_limit_error"] } }) },
+    { body: JSON.stringify({ error: { message: "invalid schema", details: { code: "too_many_requests" } } }) },
+    { body: JSON.stringify({ error: { message: WRAPPED_RATE_LIMIT_MESSAGE + " insufficient_quota" } }), terminal: true },
+    { body: JSON.stringify({ error: { type: "rate_limit_error", message: "available balance is not enough" } }), terminal: true },
+    { body: JSON.stringify({ error: { code: "insufficient_quota", message: JSON.parse(SIGNATURE_ERROR).error.message } }), terminal: true },
+    { body: JSON.stringify({ code: "too_many_requests", error: { code: "quota_exceeded", message: "busy" } }), terminal: true },
+    { body: JSON.stringify({ error: { code: "too_many_requests" }, type: "invalid_api_key" }), terminal: true },
+    { status: 429, body: JSON.stringify({ error: { type: "permission_error", message: "busy" } }), terminal: true },
+    { status: 401, body: WRAPPED_RATE_LIMIT_ERROR, terminal: true },
+    { status: 403, body: JSON.stringify({ error: { code: "too_many_requests", message: "busy" } }), terminal: true },
+  ];
+  for (const item of cases) {
+    const status = item.status || 422;
+    const upstream = await startUpstream([{
+      status, headers: { "content-type": "application/json", "x-request-id": "req_rejected" }, body: item.body,
+    }]);
+    const proxyServer = await startProxy(upstream.port);
+    try {
+      const response = await request(proxyServer.port, {
+        headers: { "content-type": "application/json" }, body: JSON.stringify(anthropicPayload),
+      });
+      assert.equal(response.status, status, item.body);
+      assert.equal(response.body.toString(), item.body);
+      assert.equal(response.headers["x-upstream-filter"], "pass");
+      assert.equal(response.headers["x-request-id"], "req_rejected");
+      assert.equal(upstream.received.length, 1);
+      assert.equal(proxyServer.stats.rateRetries, 0);
+      assert.equal(proxyServer.stats.cleanupRetries, 0);
+      assert.equal(proxyServer.stats.terminalRateLimits, item.terminal ? 1 : 0);
+    } finally {
+      await proxyServer.close();
+      await upstream.close();
+    }
+  }
+});
+
+test("422 分类边界 A：截断或无法解析的 JSON 不从原文扫描嵌套代码", async () => {
+  const oversized = JSON.stringify({ details: { code: "too_many_requests" }, padding: "x".repeat(300000) });
+  assert.equal(Buffer.byteLength(oversized), 300053);
+  const malformed = '{"details":{"code":"too_many_requests"},"padding":';
+  const cases = [
+    { body: oversized, contentType: "application/json", truncated: true },
+    { body: oversized, contentType: "text/plain", truncated: true },
+    { body: malformed, contentType: "application/problem+json" },
+    { body: malformed, contentType: "text/plain" },
+    { body: "too many requests " + "x".repeat(300000), contentType: "text/plain", truncated: true },
+    { body: WRAPPED_RATE_LIMIT_MESSAGE, contentType: "application/json" },
+  ];
+  for (const item of cases) {
+    const upstream = await startUpstream([{
+      status: 422, headers: { "content-type": item.contentType, "x-request-id": "req_parse_boundary" }, body: item.body,
+    }]);
+    const proxyServer = await startProxy(upstream.port);
+    try {
+      const response = await request(proxyServer.port, {
+        headers: { "content-type": "application/json" }, body: JSON.stringify(anthropicPayload),
+      });
+      const expected = Buffer.from(item.body).subarray(0, 256 * 1024);
+      assert.equal(response.status, 422);
+      assert.equal(upstream.received.length, 1, item.contentType);
+      assert.deepEqual(response.body, expected);
+      assert.equal(response.headers["content-length"], item.truncated ? undefined : String(expected.length));
+      if (item.truncated) assert.equal(response.headers["transfer-encoding"], "chunked");
+      assert.equal(response.headers["x-upstream-filter"], "pass");
+      assert.equal(response.headers["x-request-id"], "req_parse_boundary");
+      assert.equal(proxyServer.stats.rateRetries, 0);
+      assert.equal(proxyServer.stats.cleanupRetries, 0);
+    } finally {
+      await proxyServer.close();
+      await upstream.close();
+    }
+  }
+});
+
+test("422 分类边界 B：次优先指定文本中的终态也排除重放和清理", async () => {
+  const cases = [
+    { error: { message: "busy", code: "too_many_requests" }, message: "Available balance is not enough, please recharge" },
+    { error: "Responses upstream too_many_requests: busy", message: "insufficient_quota" },
+    { error: { message: JSON.parse(SIGNATURE_ERROR).error.message }, message: "invalid api key" },
+  ];
+  for (const item of cases) {
+    const errorBody = JSON.stringify(item);
+    const upstream = await startUpstream([{
+      status: 422, headers: { "content-type": "application/json" }, body: errorBody,
+    }]);
+    const proxyServer = await startProxy(upstream.port);
+    try {
+      const response = await request(proxyServer.port, {
+        headers: { "content-type": "application/json" }, body: JSON.stringify(anthropicPayload),
+      });
+      assert.equal(response.status, 422);
+      assert.equal(upstream.received.length, 1, errorBody);
+      assert.equal(response.body.toString(), errorBody);
+      assert.equal(response.headers["x-upstream-filter"], "pass");
+      assert.equal(proxyServer.stats.rateRetries, 0);
+      assert.equal(proxyServer.stats.cleanupRetries, 0);
+      assert.equal(proxyServer.stats.terminalRateLimits, 1);
+    } finally {
+      await proxyServer.close();
+      await upstream.close();
+    }
+  }
+});
+
+test("422 分类边界 C：明确权限拒绝文本优先于结构化限流代码", async () => {
+  for (const message of ["permission denied", "Access denied", "Unauthorized", "Forbidden"]) {
+    const errorBody = JSON.stringify({ type: "rate_limit_error", error: { message } });
+    const upstream = await startUpstream([{
+      status: 422, headers: { "content-type": "application/json" }, body: errorBody,
+    }]);
+    const proxyServer = await startProxy(upstream.port);
+    try {
+      const response = await request(proxyServer.port, {
+        headers: { "content-type": "application/json" }, body: JSON.stringify(anthropicPayload),
+      });
+      assert.equal(response.status, 422);
+      assert.equal(upstream.received.length, 1, message);
+      assert.equal(response.body.toString(), errorBody);
+      assert.equal(response.headers["x-upstream-filter"], "pass");
+      assert.equal(proxyServer.stats.rateRetries, 0);
+      assert.equal(proxyServer.stats.cleanupRetries, 0);
+      assert.equal(proxyServer.stats.terminalRateLimits, 1);
+    } finally {
+      await proxyServer.close();
+      await upstream.close();
+    }
+  }
+});
+
+test("422 分类边界 D：限流代码与签名错误冲突时只退避重放原字节", async () => {
+  const errorBody = JSON.stringify({
+    error: { code: "too_many_requests", message: "Invalid signature in thinking block: signature verification failed" },
+  });
+  for (const gzip of [false, true]) {
+    const upstream = await startUpstream([
+      { status: 422, headers: { "content-type": "application/json", "retry-after": "0" }, body: errorBody },
+      { status: 200, headers: { "content-type": "application/json" }, body: '{"ok":true}' },
+    ]);
+    const proxyServer = await startProxy(upstream.port);
+    try {
+      const plain = Buffer.from(JSON.stringify(anthropicPayload, null, 2));
+      const bytes = gzip ? zlib.gzipSync(plain) : plain;
+      const response = await request(proxyServer.port, {
+        headers: { "content-type": "application/json", "content-length": String(bytes.length),
+          ...(gzip ? { "content-encoding": "gzip" } : {}) }, body: bytes,
+      });
+      assert.equal(response.status, 200);
+      assert.equal(upstream.received.length, 2);
+      for (const seen of upstream.received) {
+        assert.deepEqual(seen.body, bytes);
+        assert.equal(seen.headers["content-encoding"], gzip ? "gzip" : undefined);
+        assert.equal(seen.headers["content-length"], String(bytes.length));
+      }
+      assert.equal(response.headers["x-upstream-filter"], "rate-retried");
+      assert.equal(proxyServer.stats.rateRetries, 1);
+      assert.equal(proxyServer.stats.cleanupRetries, 0);
+    } finally {
+      await proxyServer.close();
+      await upstream.close();
+    }
+  }
+});
+
+test("422 包装限流预算耗尽：首次 + 20 次重放后保留 422 和错误字节", async () => {
+  const upstream = await startUpstream([{
+    status: 422, headers: { "content-type": "application/json", "x-request-id": "req_peak", "retry-after": "0" },
+    body: WRAPPED_RATE_LIMIT_ERROR,
+  }]);
+  const proxyServer = await startProxy(upstream.port);
+  try {
+    const bytes = Buffer.from(JSON.stringify(anthropicPayload, null, 2));
+    const response = await request(proxyServer.port, {
+      headers: { "content-type": "application/json" }, body: bytes,
+    });
+    assert.equal(response.status, 422);
+    assert.equal(response.body.toString(), WRAPPED_RATE_LIMIT_ERROR);
+    assert.equal(response.headers["x-upstream-filter"], "rate-exhausted");
+    assert.equal(response.headers["x-request-id"], "req_peak");
+    assert.equal(response.headers["retry-after"], "0");
+    assert.equal(upstream.received.length, 21);
+    assert.ok(upstream.received.every((seen) => seen.body.equals(bytes)));
+    assert.equal(proxyServer.stats.rateRetries, 20);
+    assert.equal(proxyServer.stats.rateExhausted, 1);
+    assert.equal(proxyServer.stats.cleanupRetries, 0);
+  } finally {
+    await proxyServer.close();
+    await upstream.close();
+  }
+});
+
+test("422 限流继续尊重 retry-after：未到 1 秒不重放", async () => {
+  const upstream = await startUpstream([
+    { status: 422, headers: { "content-type": "application/json", "retry-after": "1" }, body: WRAPPED_RATE_LIMIT_ERROR },
+    { status: 200, body: "{}" },
+  ]);
+  const proxyServer = await startProxy(upstream.port);
+  try {
+    const start = Date.now();
+    const response = await request(proxyServer.port, {
+      headers: { "content-type": "application/json" }, body: JSON.stringify(anthropicPayload),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(upstream.received.length, 2);
+    assert.ok(Date.now() - start >= 1000, "retry-after 应覆盖毫秒级默认退避");
+    assert.equal(proxyServer.stats.rateRetries, 1);
+  } finally {
+    await proxyServer.close();
+    await upstream.close();
+  }
+});
+
+test("422 限流退避中取消：超过 retry-after 窗口后仍无迟到重放", { timeout: 10000 }, async () => {
+  const upstream = await startUpstream([{
+    status: 422, headers: { "content-type": "application/json", "retry-after": "1" }, body: WRAPPED_RATE_LIMIT_ERROR,
+  }]);
+  const proxyServer = await startProxy(upstream.port, { backoffBaseMs: 500, backoffMaxMs: 1000 });
+  try {
+    await new Promise((resolve, reject) => {
+      const cancelled = new Error("test client cancel");
+      const req = http.request({
+        host: "127.0.0.1", port: proxyServer.port, method: "POST", path: "/v1/messages",
+        headers: { "content-type": "application/json" },
+      }, (res) => {
+        res.resume();
+        reject(new Error("422 应进入退避，不应在取消前透传给客户端"));
+      });
+      const timer = setTimeout(() => req.destroy(cancelled), 100);
+      req.on("error", (error) => {
+        clearTimeout(timer);
+        if (error === cancelled) resolve();
+        else reject(error);
+      });
+      req.end(JSON.stringify(anthropicPayload));
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1200)); // 完整越过 1s 退避，检查迟到重放
+    assert.equal(upstream.received.length, 1);
+    assert.equal(proxyServer.stats.rateRetries, 0);
+    assert.equal(proxyServer.stats.errors, 0);
+    const health = await request(proxyServer.port, { method: "GET", path: "/healthz" });
+    assert.equal(health.status, 200);
+  } finally {
+    await proxyServer.close();
+    await upstream.close();
+  }
+});
+
+test("HTTP 200 SSE 内 too_many_requests 错误事件原样透传，不启动重放", async () => {
+  const sse = `event: error\ndata: ${WRAPPED_RATE_LIMIT_ERROR}\n\n`;
+  const upstream = await startUpstream([{
+    status: 200, headers: { "content-type": "text/event-stream" },
+    stream: (res) => { res.write(sse); res.end(); },
+  }]);
+  const proxyServer = await startProxy(upstream.port);
+  try {
+    const response = await request(proxyServer.port, {
+      headers: { "content-type": "application/json" }, body: JSON.stringify(anthropicPayload),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers["x-upstream-filter"], "pass");
+    assert.equal(response.body.toString(), sse);
+    assert.equal(upstream.received.length, 1);
+    assert.equal(proxyServer.stats.rateRetries, 0);
+    assert.equal(proxyServer.stats.cleanupRetries, 0);
   } finally {
     await proxyServer.close();
     await upstream.close();
