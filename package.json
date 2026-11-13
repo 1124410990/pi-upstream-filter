@@ -1,13 +1,13 @@
 {
   "name": "pi-upstream-filter",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/1124410990/pi-upstream-filter.git"
   },
-  "description": "Pi 中转端点密文/签名兼容性错误后一次性恢复扩展，附 Claude Code 本地代理模式",
+  "description": "Pi 中转端点密文/签名兼容性错误后有界恢复扩展，附 Claude Code 本地代理模式",
   "keywords": ["pi-package"],
   "engines": {
     "node": ">=22.19.0"

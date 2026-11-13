@@ -38,6 +38,20 @@ function fail(message = rejection, status = 400) {
   return new Response(JSON.stringify({error: {type: "invalid_request_error", message}}),
     {status, headers: {"content-type": "application/json"}});
 }
+function compatibilityFailure(api, transport = "http") {
+  const message = api === "anthropic-messages" ? "Invalid signature in thinking block" : rejection;
+  if (transport === "http") return fail(message);
+  return api === "anthropic-messages"
+    ? sse([{type: "error", error: {type: "invalid_request_error", message}}])
+    : sse([{type: "response.failed", response: {status: "failed", error: {code: "invalid_encrypted_content", message}}}]);
+}
+function transientFailure(api, transport, status) {
+  const message = status === 429 ? "Your requests have exceeded token rate limit." : "internal server error";
+  if (transport === "http") return fail(message, status);
+  return api === "anthropic-messages"
+    ? sse([{type: "error", error: {type: status === 429 ? "rate_limit_error" : "api_error", message}}])
+    : sse([{type: "response.failed", response: {status: "failed", error: {code: status === 429 ? "rate_limit_exceeded" : "server_error", message}}}]);
+}
 
 async function harness(t, {api = "openai-responses", baseUrl = "https://agentrouter.org/v1", respond,
     history = true, toolHistory = false, retry = false, debug = false, config, extraExtension} = {}) {
@@ -112,9 +126,16 @@ async function harness(t, {api = "openai-responses", baseUrl = "https://agentrou
     modelRuntime: runtime, model, thinkingLevel: "high", settingsManager: settings, resourceLoader: loader,
     sessionManager: sm, tools: []}));
   const errors = [];
-  await session.bindExtensions({onError: error => errors.push(error)});
+  const notices = [];
+  const retries = [];
+  await session.bindExtensions({onError: error => errors.push(error),
+    uiContext: {notify: (message, level) => notices.push({message, level})}});
+  const unsubscribe = session.subscribe(event => {
+    if (["auto_retry_start", "auto_retry_end"].includes(event.type)) retries.push(event);
+  });
+  t.after(unsubscribe);
   const run = async (text = "完成原任务") => {await session.prompt(text); await session.waitForIdle();};
-  return {session, sm, seen, errors, run, historyId,
+  return {session, sm, seen, errors, notices, retries, run, historyId,
     logs: () => fs.readFileSync(path.join(process.env.PI_CODING_AGENT_DIR, "pi-upstream-filter.log"), "utf8")};
 }
 
@@ -124,7 +145,7 @@ function carriesReasoning(body) {
 }
 
 for (const api of ["openai-responses", "anthropic-messages"]) {
-  test(`真实 ${api}：成功请求不剥离；相关 400 恢复原任务一次，不增加用户消息`, {timeout: 15000}, async t => {
+  test(`真实 ${api}：成功请求不剥离；相关 400 恢复原任务，不增加用户消息`, {timeout: 15000}, async t => {
     const h = await harness(t, {api, debug: true, respond: calls => calls === 2
       ? fail(api === "anthropic-messages" ? "Invalid `signature` in `thinking` block" : rejection)
       : success(api, "filter-test")});
@@ -158,6 +179,153 @@ for (const api of ["openai-responses", "anthropic-messages"]) {
     assert.doesNotMatch(logs, /opaque-cipher|opaque-signature|原始上下文|历史回答/);
   });
 }
+
+for (const api of ["openai-responses", "anthropic-messages"]) {
+  for (const transport of ["http", "sse"]) {
+    test(`真实 ${api}/${transport}：raw400→clean400→clean成功，成功后重新raw且预算重置`, {timeout: 15000}, async t => {
+      let cleaned = 0;
+      let recovered = false;
+      const h = await harness(t, {api, respond: (_calls, body) => {
+        if (recovered) return success(api, "filter-test");
+        if (carriesReasoning(body) || cleaned++ === 0) return compatibilityFailure(api, transport);
+        return success(api, "filter-test");
+      }});
+      const original = JSON.stringify(h.sm.getEntry(h.historyId));
+      await h.run();
+      assert.equal(h.seen.length, 3);
+      assert.deepEqual(h.seen.map(carriesReasoning), [true, false, false]);
+      assert.equal(h.sm.getEntries().filter(entry => entry.type === "context_edit").length, 2);
+      assert.equal(h.session.messages.filter(message => message.role === "user").length, 2);
+      assert.ok(h.notices.some(notice => /恢复 2\/20/.test(notice.message)));
+      assert.equal(JSON.stringify(h.sm.getEntry(h.historyId)), original);
+      recovered = true;
+      await h.run("成功后新任务");
+      assert.equal(carriesReasoning(h.seen[3]), true);
+      recovered = false;
+      cleaned = 0;
+      await h.run("新的兼容性失败");
+      assert.deepEqual(h.seen.slice(4).map(carriesReasoning), [true, false, false]);
+      assert.match(h.notices.filter(notice => /兼容性恢复 \d+\/20/.test(notice.message)).at(-2).message, /恢复 1\/20/);
+      assert.deepEqual(h.errors, []);
+    });
+
+    for (const scenario of ["rate", "server", "rate-then-400"]) {
+      test(`真实 ${api}/${transport}：兼容性400后${scenario}原生retry仍clean`, {timeout: 15000}, async t => {
+        let cleaned = 0;
+        const h = await harness(t, {api, retry: true, respond: (_calls, body) => {
+          if (carriesReasoning(body)) return compatibilityFailure(api, transport);
+          const attempt = cleaned++;
+          if (attempt === 0) return transientFailure(api, transport, scenario === "server" ? 500 : 429);
+          if (scenario === "rate-then-400" && attempt === 1) return compatibilityFailure(api, transport);
+          return success(api, "filter-test");
+        }});
+        const original = JSON.stringify(h.sm.getEntry(h.historyId));
+        await h.run();
+        assert.equal(h.seen.length, scenario === "rate-then-400" ? 4 : 3);
+        assert.deepEqual(h.seen.map(carriesReasoning), [true, ...Array(h.seen.length - 1).fill(false)]);
+        assert.equal(h.retries.filter(event => event.type === "auto_retry_start").length, 1, "保留宿主原生retry，不额外增加预算");
+        assert.equal(h.session.messages.filter(message => message.role === "user").length, 2, "恢复不能发送用户继续");
+        assert.equal(h.sm.getEntries().filter(entry => entry.type === "context_edit").length, h.seen.length - 1);
+        assert.equal(JSON.stringify(h.sm.getEntry(h.historyId)), original);
+        const scheduled = h.notices.filter(notice => /兼容性恢复 \d+\/20/.test(notice.message));
+        assert.equal(scheduled.length, scenario === "rate-then-400" ? 2 : 1, "原生retry继承不消耗逻辑恢复预算");
+        assert.doesNotMatch(h.notices.map(notice => notice.message).join("\n"), /不再为本次失败/);
+        assert.deepEqual(h.errors, []);
+      });
+    }
+  }
+}
+
+test("真实 Responses：不同兼容性错误连续更新规则，input[N]定位实际发送项而不误清工具配对", {timeout: 15000}, async t => {
+  let cleaned = 0;
+  const h = await harness(t, {toolHistory: true, respond: (_calls, body) => {
+    if (carriesReasoning(body)) return fail("invalid_encrypted_content");
+    const attempt = cleaned++;
+    if (attempt === 0) {
+      const index = body.input.findIndex(item => item.id === "msg_old");
+      assert.ok(index >= 0);
+      return fail(`Invalid 'input[${index}].id': Expected an ID that begins with 'msg_'`);
+    }
+    assert.equal(body.input.some(item => item.id === "msg_old"), false);
+    return success("openai-responses", "filter-test");
+  }});
+  await h.run();
+  assert.equal(h.seen.length, 3);
+  assert.deepEqual(h.seen.map(carriesReasoning), [true, false, false]);
+  assert.ok(h.seen[1].input.some(item => item.id === "msg_old"));
+  const calls = h.seen.slice(1).map(body => body.input.find(item => item.type === "function_call"));
+  assert.ok(calls[0]?.id);
+  assert.equal(calls[0].id, calls[1].id, "点名普通消息的id不能误清后面的工具id");
+  const output = h.seen[2].input.find(item => item.type === "function_call_output");
+  assert.equal(calls[1].call_id, output.call_id);
+  assert.match(output.output, /business-result/);
+  assert.deepEqual(h.errors, []);
+});
+
+test("真实 Responses：ID→密文→相同索引ID错误仍定位移动后的工具项", {timeout: 15000}, async t => {
+  let index;
+  const h = await harness(t, {toolHistory: true, respond: (calls, body) => {
+    if (calls === 1) {
+      index = body.input.findIndex(item => item.id === "msg_old");
+      assert.ok(index >= 0);
+      return fail(`Invalid 'input[${index}].id': Expected an ID that begins with 'msg_'`);
+    }
+    assert.equal(body.input.some(item => item.id === "msg_old"), false);
+    if (calls === 2) {
+      assert.equal(carriesReasoning(body), true);
+      return fail("invalid_encrypted_content");
+    }
+    assert.equal(carriesReasoning(body), false);
+    assert.equal(body.input[index].type, "function_call", "删除reasoning后同索引应已指向工具项");
+    if (calls === 3) {
+      assert.ok(body.input[index].id);
+      return fail(`Invalid 'input[${index}].id': Expected an ID that begins with 'fc_'`);
+    }
+    assert.equal(body.input[index].id, undefined);
+    return success("openai-responses", "filter-test");
+  }});
+  const original = JSON.stringify(h.sm.getEntry(h.historyId));
+  await h.run();
+  assert.equal(h.seen.length, 4);
+  assert.deepEqual(h.seen.map(carriesReasoning), [true, true, false, false]);
+  const body = h.seen[3];
+  const call = body.input.find(item => item.type === "function_call");
+  const output = body.input.find(item => item.type === "function_call_output");
+  const originalCall = h.seen[0].input.find(item => item.type === "function_call");
+  const originalOutput = h.seen[0].input.find(item => item.type === "function_call_output");
+  assert.equal(call.call_id, originalCall.call_id);
+  assert.equal(output.call_id, originalOutput.call_id);
+  assert.equal(output.id, originalOutput.id);
+  assert.match(call.arguments, /business-path/);
+  assert.match(output.output, /business-result/);
+  assert.equal(JSON.stringify(h.sm.getEntry(h.historyId)), original);
+  assert.deepEqual(h.errors, []);
+});
+
+test("真实宿主：原请求和兼容性清理后混合余额终态HTTP/SSE错误必须停止", {timeout: 15000}, async t => {
+  for (const api of ["openai-responses", "anthropic-messages"]) {
+    for (const transport of ["http", "sse"]) {
+      for (const afterClean of [false, true]) {
+        await t.test(`${api}/${transport}/${afterClean ? "clean" : "raw"}`, async t => {
+          const message = `${api === "anthropic-messages" ? "Invalid signature in thinking block" : rejection}; usage_limit_exceeded: out of budget; FreeUsageLimitError`;
+          const h = await harness(t, {api, respond: calls => {
+            if (afterClean && calls === 1) return compatibilityFailure(api, transport);
+            if (transport === "http") return fail(message);
+            return api === "anthropic-messages"
+              ? sse([{type: "error", error: {type: "invalid_request_error", message}}])
+              : sse([{type: "response.failed", response: {status: "failed", error: {code: "invalid_encrypted_content", message}}}]);
+          }});
+          await h.run();
+          assert.equal(h.seen.length, afterClean ? 2 : 1, "终态限制不能被兼容性措辞覆盖而追加清理");
+          assert.deepEqual(h.seen.map(carriesReasoning), afterClean ? [true, false] : [true]);
+          assert.equal(h.session.messages.at(-1).stopReason, "error");
+          assert.equal(h.notices.filter(notice => /兼容性恢复 \d+\/20/.test(notice.message)).length, afterClean ? 1 : 0);
+          assert.deepEqual(h.errors, []);
+        });
+      }
+    }
+  }
+});
 
 test("真实 provider 清理不能破坏工具调用配对和业务结果", {timeout: 15000}, async t => {
   for (const api of ["openai-responses", "anthropic-messages"]) {
@@ -200,16 +368,60 @@ test("真实 Responses：HTTP 200 SSE 密文错误也能一次恢复，保留有
   assert.deepEqual(h.errors, []);
 });
 
-test("持续兼容性失败只能清理一次；无可清理内容与非白名单不额外重试", {timeout: 15000}, async t => {
-  for (const scenario of ["persistent", "empty", "other-host", "disabled", "unrelated"]) {
+for (const api of ["openai-responses", "anthropic-messages"]) {
+  for (const transport of ["http", "sse"]) {
+    test(`真实 ${api}/${transport}：持续兼容性失败20次恢复上限，不发第21次`, {timeout: 15000}, async t => {
+      const h = await harness(t, {api, respond: () => compatibilityFailure(api, transport)});
+      await h.run();
+      assert.equal(h.seen.length, 21, "原请求加20次恢复，不发第22个模型请求");
+      assert.deepEqual(h.seen.map(carriesReasoning), [true, ...Array(20).fill(false)]);
+      assert.equal(h.sm.getEntries().filter(entry => entry.type === "context_edit").length, 20);
+      assert.equal(h.notices.filter(notice => /兼容性恢复 \d+\/20/.test(notice.message)).length, 20);
+      assert.match(h.notices.at(-1).message, /20 次已耗尽.*第 21 次/);
+      assert.equal(h.session.messages.filter(message => message.role === "user").length, 2);
+      assert.deepEqual(h.errors, []);
+    });
+  }
+}
+
+test("真实宿主：耗尽旧预算后排队user/custom新任务仍raw→clean恢复成功", {timeout: 15000}, async t => {
+  for (const role of ["user", "custom"]) {
+    await t.test(role, async t => {
+      const text = role === "custom" ? "排队自定义新任务" : "排队真人新任务";
+      const h = await harness(t, {respond: async (calls, body, session) => {
+        if (calls === 21) {
+          if (role === "custom") {
+            await session.sendCustomMessage({customType: "queued-new-task", content: text, display: true},
+              {triggerTurn: true, deliverAs: "followUp"});
+          } else {
+            await session.followUp(text);
+          }
+        }
+        return JSON.stringify(body).includes(text) && !carriesReasoning(body)
+          ? success("openai-responses", "filter-test") : fail();
+      }});
+      const original = JSON.stringify(h.sm.getEntry(h.historyId));
+      await h.run();
+      assert.equal(h.seen.length, 23, "旧任务21次请求，加新任务raw与clean各一次");
+      assert.deepEqual(h.seen.slice(-3).map(carriesReasoning), [false, true, false]);
+      assert.equal(h.session.messages.at(-1).stopReason, "stop");
+      assert.match(h.notices.filter(notice => /兼容性恢复 \d+\/20/.test(notice.message)).at(-1).message, /恢复 1\/20/);
+      assert.equal(h.session.messages.filter(message => message.role === "user").length, role === "user" ? 3 : 2);
+      assert.equal(JSON.stringify(h.sm.getEntry(h.historyId)), original);
+      assert.deepEqual(h.errors, []);
+    });
+  }
+});
+
+test("无可清理内容、非白名单、关闭与无关400不额外重试", {timeout: 15000}, async t => {
+  for (const scenario of ["empty", "other-host", "disabled", "unrelated"]) {
     await t.test(scenario, async t => {
       const h = await harness(t, {history: scenario !== "empty",
         baseUrl: scenario === "other-host" ? "https://example.test/v1" : undefined,
         config: scenario === "disabled" ? {responses: false} : undefined,
         respond: () => fail(scenario === "unrelated" ? "Invalid request: malformed JSON" : rejection)});
       await h.run();
-      assert.equal(h.seen.length, scenario === "persistent" ? 2 : 1);
-      if (scenario === "persistent") assert.equal(carriesReasoning(h.seen[1]), false);
+      assert.equal(h.seen.length, 1);
       assert.deepEqual(h.errors, []);
     });
   }
